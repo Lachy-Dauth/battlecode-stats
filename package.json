@@ -5,7 +5,10 @@
   "description": "Unofficial stats, odds and history for UNSW Battlecode 2026",
   "scripts": {
     "scrape": "node scraper/scrape.mjs --state .cache/state --out site/data",
-    "serve": "python3 -m http.server 8080 --directory site"
+    "serve": "python3 -m http.server 8080 --directory site",
+    "publish": "scripts/publish.sh"
   },
-  "engines": { "node": ">=20" }
+  "engines": {
+    "node": ">=20"
+  }
 }

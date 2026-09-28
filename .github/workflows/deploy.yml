@@ -1,0 +1,42 @@
+name: Deploy site
+
+# game.battlecode.au refuses requests from GitHub Actions (HTTP 403), so
+# scraping runs elsewhere (scripts/publish.sh) and pushes the `data` branch.
+# This workflow only combines site/ with the latest snapshot and deploys it.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Fetch latest data snapshot
+        run: |
+          git clone --quiet --depth 1 --branch data \
+            "https://github.com/${{ github.repository }}.git" databranch
+          rm -rf site/data && cp -R databranch/public site/data
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

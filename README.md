@@ -1,6 +1,6 @@
 # Battlecode Stats
 
-An unofficial stats site for [UNSW Battlecode 2026](https://game.battlecode.au), hosted on GitHub Pages and refreshed every hour.
+An unofficial stats site for [UNSW Battlecode 2026](https://game.battlecode.au), hosted on GitHub Pages: **https://lachy-dauth.github.io/battlecode-stats/**
 
 - **Leaderboard**: by default, only teams with an active bot and the ranked switch on, i.e. the teams you can request ranked battles against. It also shows 24h Elo change, a season trend line, game record, recent activity, switch cooldowns, "new bot" flags, and simulated Sprint and Qualifier odds. You can filter by APAC eligibility, first-year, WGM, UNSW, high school, language, or "teams I can challenge".
 - **Team pages**: full Elo and rank history (with an overlay to compare another team), submission history, head-to-head records, per-map win rates, and recent battles with replay links.
@@ -15,34 +15,39 @@ An unofficial stats site for [UNSW Battlecode 2026](https://game.battlecode.au),
 scraper/        Node 20+, no dependencies
   lib.mjs       polite fetcher (≈3 req/s, retries, backoff) + SvelteKit devalue decoder
   scrape.mjs    leaderboard → tournaments → battles → team pages → match details → JSON
+scripts/
+  publish.sh    scrape, push the snapshot to the `data` branch, trigger a redeploy
 site/           static page, no build step
   js/model.js   Elo maths, series odds, bracket simulator (shared with the worker)
   js/app.js     views + hash router
-.github/workflows/update.yml   hourly: scrape, save state, deploy Pages
+.github/workflows/deploy.yml   deploy site/ + latest snapshot to Pages
 ```
 
-game.battlecode.au is a SvelteKit app, and every page exposes its data at `<page>/__data.json`. The scraper reads those public endpoints, so it needs no login or API key. The site sends no CORS headers, so the browser can't fetch from it directly. The Action therefore snapshots the data and publishes it alongside the page.
+game.battlecode.au is a SvelteKit app, and every page exposes its data at `<page>/__data.json`. The scraper reads those public endpoints anonymously: no login, no API key, no cookies.
 
-The accumulated state (every battle seen, plus sampled match details) lives on a `data` branch. Each run force-pushes that branch as a single commit, so the repository history doesn't grow. The first run backfills the whole battle history, which takes about 15 minutes. Later runs take a minute or two.
+**Where the scrape runs.** game.battlecode.au refuses requests from GitHub Actions (HTTP 403 from its Cloudflare edge), so the scrape runs on a normal machine with `scripts/publish.sh`. GitHub only hosts the snapshot and deploys it. The site sends no CORS headers either, so the browser can't fetch live data directly.
+
+The accumulated state (every battle seen, plus sampled match details) lives on the `data` branch next to the published JSON. Each publish force-pushes that branch as a single commit, so the repository history doesn't grow. A fresh machine picks up from that state, so only the very first run backfills the whole season (about 15 minutes). Later runs take one to three minutes.
 
 ### Submissions
 
-Other teams' bots and upload lists aren't public. Each match does record which submission ID each side played, so the scraper samples at least one recent match per active team every run. On its first run it also samples the top 100 teams roughly every 8 hours back to the start of the season. A team page lists each submission ID with the window it was seen in. Its record only counts battles that fall between two sightings of that same submission.
+Other teams' bots and upload lists aren't public. Each match does record which submission ID each side played, so the scraper samples at least one recent match per active team every run. It prefers ranked battles, which always use the team's active bot; unranked challenges can use any of the requester's submissions. The first run also sampled the top teams' history back to the start of the season. A team page lists each active submission ID with the window it was seen in, plus any other submissions seen only in unranked battles the team requested.
 
 ## Local development
 
 ```bash
-npm run scrape   # writes .cache/state and site/data (first run ≈15 min)
-npm run serve    # http://localhost:8080
+npm run scrape    # writes .cache/state and site/data
+npm run serve     # http://localhost:8080
+npm run publish   # scrape + push the data branch + redeploy Pages (needs an authenticated gh)
 ```
 
-Environment knobs for the scraper: `SCRAPER_GAP_MS` (default 350), `SCRAPER_CONCURRENCY` (2), `MAX_BATTLE_PAGES`, `DETAIL_CAP`, `BACKFILL_TEAMS`, `BACKFILL_DETAIL_CAP`, `TEAM_PAGE_CAP`.
+Environment knobs for the scraper: `SCRAPER_GAP_MS` (default 350), `SCRAPER_CONCURRENCY` (2), `MAX_BATTLE_PAGES`, `DETAIL_CAP`, `TEAM_REFRESH_H`, `TEAM_PAGE_CAP`.
 
-## Deploying
+To refresh hourly, schedule `scripts/publish.sh` with cron or launchd, for example:
 
-1. Push this repository to GitHub.
-2. Under **Settings → Pages**, set **Source** to **GitHub Actions**.
-3. Run the **Update stats** workflow, or wait for the hourly schedule.
+```
+17 * * * * cd /path/to/battlecode-stats && ./scripts/publish.sh >> publish.log 2>&1
+```
 
 ## Caveats
 

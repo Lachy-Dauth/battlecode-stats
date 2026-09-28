@@ -78,7 +78,7 @@ function switchCell(t) {
 
 function setUpdated() {
   const t = S.meta?.updatedAt;
-  $('#updated').innerHTML = t ? `Data updated ${ago(t)} (${esc(fmtWhen(t))}). Refreshed hourly.` : '';
+  $('#updated').innerHTML = t ? `Data updated ${ago(t)} (${esc(fmtWhen(t))}). ` : '';
 }
 
 function teamOptions() {
@@ -896,7 +896,7 @@ function viewAbout() {
   const m = S.meta;
   main.innerHTML = `
     <h1>About</h1>
-    <div class="card"><p class="lede" style="margin-top:0">An unofficial companion to <a href="${SITE}">UNSW Battlecode 2026</a>. A GitHub Action reads the public pages of game.battlecode.au every hour and publishes the snapshot here. No login or API key is involved.</p>
+    <div class="card"><p class="lede" style="margin-top:0">An unofficial companion to <a href="${SITE}">UNSW Battlecode 2026</a>. A scheduled job reads the public pages of game.battlecode.au and publishes the snapshot here. It uses no login, API key or cookies, so it only sees what any visitor sees.</p>
     <h3>What's collected</h3>
     <ul>
       <li><b>Leaderboard</b>: every team, rating, record, eligibility tags and ranked-switch setting.</li>
@@ -906,7 +906,7 @@ function viewAbout() {
       <li><b>Tournaments</b>: the Sprint and Qualifiers brackets as currently seeded.</li>
     </ul>
     <h3>Submissions</h3>
-    <p>Other teams' bots can't be downloaded, and the site doesn't list their uploads. It does record, for every match, which submission ID each side played. Each run samples at least one recent match per active team, so a new submission shows up within about an hour. The top ${100} teams also had their history sampled every ~8 hours back to the start. A submission's record only counts battles between two sightings of that same submission, so switches between sightings are never misattributed.</p>
+    <p>Other teams' bots can't be downloaded, and the site doesn't list their uploads. It does record, for every match, which submission ID each side played. Each run samples a recent match per active team, preferring ranked battles, so a new bot shows up within a run or two. Ranked battles always use a team's active bot, and so do unranked battles someone else requested. Unranked battles a team requested itself may use any of its submissions, so those appear separately as likely tests. A submission's record only counts battles seen with it, plus ranked battles between two sightings of it.</p>
     <h3>Odds</h3>
     <p>Per-game win probability is the Elo expectation 1 / (1 + 10<sup>(R<sub>B</sub> − R<sub>A</sub>)/D</sup>), with D = 400 as on the site or D fitted to recent ranked games. Series odds treat games as independent (draws ignored). Rating changes use the site's rule: K falls from 96 for a new submission to 24 after 10 ranked battles. Tournament odds simulate the site's tentative brackets, which are re-seeded from the ladder after the final autoscrims, so they will shift. The optional rating uncertainty draws each team's strength from Elo ± σ once per simulated season. The Grand Final format is an assumption, noted on that page.</p>
     <h3>Caveats</h3>
