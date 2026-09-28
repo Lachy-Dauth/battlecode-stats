@@ -27,7 +27,21 @@ game.battlecode.au is a SvelteKit app, and every page exposes its data at `<page
 
 **Where the scrape runs.** game.battlecode.au refuses requests from GitHub Actions (HTTP 403 from its Cloudflare edge), so the scrape runs on a normal machine with `scripts/publish.sh`. GitHub only hosts the snapshot and deploys it. The site sends no CORS headers either, so the browser can't fetch live data directly.
 
-The accumulated state (every battle seen, plus sampled match details) lives on the `data` branch next to the published JSON. Each publish force-pushes that branch as a single commit, so the repository history doesn't grow. A fresh machine picks up from that state, so only the very first run backfills the whole season (about 15 minutes). Later runs take one to three minutes.
+The accumulated state (every battle seen, plus sampled match details) lives on the `data` branch next to the published JSON. Each publish force-pushes that branch as a single commit, so the repository history doesn't grow. A fresh machine picks up from that state, so only the very first run backfills the whole season (about 15 minutes).
+
+**What an hourly run costs.** About 100 requests and 3 MB, at no more than about 3 requests a second:
+
+| Read | Requests | What for |
+|---|---|---|
+| Leaderboard | ~10 | Ratings, switches, eligibility, and each team's rank (the rank history) |
+| Battle list | ~15 | New battles since the last run |
+| Match details | up to 120 | Which bot each team is running; each team is re-checked at most every 2 hours |
+| Team pages | only new teams | Read once, for the description and the history from before we started watching |
+| Tournaments | ~3 | Brackets |
+
+Team pages are never re-read. Every ranked battle carries the pre-battle Elo and the change, so Elo history and win/loss records carry forward from the battle log exactly, and rank history comes from the leaderboard. The data branch is kept locally between runs, so each push uploads only the files that changed.
+
+Knobs: `DETAIL_CAP` (matches sampled per run, default 120) and `RESAMPLE_H` (hours before a team's bot is re-checked, default 2).
 
 ### Submissions
 
@@ -41,7 +55,7 @@ npm run serve     # http://localhost:8080
 npm run publish   # scrape + push the data branch + redeploy Pages (needs an authenticated gh)
 ```
 
-Environment knobs for the scraper: `SCRAPER_GAP_MS` (default 350), `SCRAPER_CONCURRENCY` (2), `MAX_BATTLE_PAGES`, `DETAIL_CAP`, `TEAM_REFRESH_H`, `TEAM_PAGE_CAP`.
+Environment knobs for the scraper: `SCRAPER_GAP_MS` (default 350), `SCRAPER_CONCURRENCY` (2), `MAX_BATTLE_PAGES`, `DETAIL_CAP`, `RESAMPLE_H`, `TEAM_PAGE_CAP`.
 
 To refresh hourly, schedule `scripts/publish.sh` with cron or launchd, for example:
 

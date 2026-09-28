@@ -18,7 +18,8 @@ const STATE = path.resolve(args.state || '.cache/state');
 const OUT = path.resolve(args.out || 'site/data');
 const env = (k, d) => Number(process.env[k] ?? d);
 const MAX_BATTLE_PAGES = env('MAX_BATTLE_PAGES', 1500);   // backfill ceiling (100 battles/page)
-const DETAIL_CAP = env('DETAIL_CAP', 450);                // match details per incremental run
+const DETAIL_CAP = env('DETAIL_CAP', 120);                // match details per incremental run
+const RESAMPLE_AFTER = env('RESAMPLE_H', 2) * 3600;        // re-check a team's bot this often
 const BACKFILL_DETAIL_CAP = env('BACKFILL_DETAIL_CAP', 900);
 const BACKFILL_TEAMS = env('BACKFILL_TEAMS', 100);        // teams whose submission history is backfilled
 const BACKFILL_SPACING = env('BACKFILL_SPACING_H', 8) * 3600;
@@ -146,14 +147,12 @@ async function fetchBattles(battles, cursor) {
 }
 
 // ---- 4. team pages -------------------------------------------------------------
-// Team pages are the heaviest reads, and between fetches the battle log fills
-// in history and record (see writeOutputs). So a changed team is only
-// re-read every few hours; the top of the ladder every run.
-const TEAM_REFRESH = env('TEAM_REFRESH_H', 6) * 3600;
-const TEAM_REFRESH_TOP = env('TEAM_REFRESH_TOP', 40);
-
+// A team page is read once, when the team first shows up, for its description
+// and the history from before we were watching. After that nothing needs it:
+// every ranked battle in the battle log carries the pre-battle Elo and the
+// change, so history and record carry forward exactly (see writeOutputs), and
+// ranks come from the leaderboard, which is read in full every run anyway.
 async function fetchTeamPages(teams, cursor) {
-  const sigs = cursor.teamSigs || {};
   if (!cursor.teamFetched) {
     cursor.teamFetched = {};
     for (const t of teams) {
@@ -162,14 +161,9 @@ async function fetchTeamPages(teams, cursor) {
     }
   }
   const fetched = cursor.teamFetched;
-  const top = new Set(teams.filter((t) => t.ranked).sort((a, b) => b.elo - a.elo).slice(0, TEAM_REFRESH_TOP).map((t) => t.id));
-  const todo = teams.filter((t) => {
-    if (!t.hasBot && !t.ranked) return false;
-    if (!fetched[t.id]) return true;
-    if (sigs[t.id] === teamSig(t)) return false;
-    return NOW - fetched[t.id] >= (top.has(t.id) ? 50 * 60 : TEAM_REFRESH);
-  }).sort((a, b) => b.elo - a.elo).slice(0, TEAM_PAGE_CAP);
-  log(`team pages: ${todo.length} changed`);
+  const todo = teams.filter((t) => (t.hasBot || t.ranked) && !fetched[t.id])
+    .sort((a, b) => b.elo - a.elo).slice(0, TEAM_PAGE_CAP);
+  log(`team pages: ${todo.length} new`);
   const res = await mapLimit(todo, async (t) => {
     const d = await pageData(`/teams/${t.id}`);
     const cached = {
@@ -184,15 +178,25 @@ async function fetchTeamPages(teams, cursor) {
       ranks: (d.ranks?.points || []).map((p) => [toSec(p.date), p.elo]),
     };
     await writeJSON(path.join(STATE, 'teams', `${t.id}.json`), cached);
-    sigs[t.id] = teamSig(t);
     fetched[t.id] = NOW;
     return true;
   }, (n, of) => log(`team pages ${n}/${of}`));
   const failed = res.filter((r) => r?.error).length;
   if (failed) log(`team pages: ${failed} failed`);
-  cursor.teamSigs = sigs;
 }
-const teamSig = (t) => `${t.elo}|${t.ranked}|${t.hasBot}`;
+
+/** Append each team's leaderboard rank whenever it changes; this is the rank history. */
+async function recordRanks(teams) {
+  const file = path.join(STATE, 'ranks.json');
+  const ranks = await readJSON(file, {});
+  for (const t of teams) {
+    if (!t.ranked) continue;
+    const list = (ranks[t.id] ||= []);
+    if (!list.length || list[list.length - 1][1] !== t.rank) list.push([NOW, t.rank]);
+  }
+  await writeJSON(file, ranks);
+  return ranks;
+}
 
 // ---- 5. match details (submission ids + maps) ------------------------------------
 async function fetchDetails(battles, details, newlyDone, teams, cursor) {
@@ -203,15 +207,22 @@ async function fetchDetails(battles, details, newlyDone, teams, cursor) {
     if (covered.has(r[B.a]) && covered.has(r[B.b])) return;
     want.set(r[0], r); covered.add(r[B.a]); covered.add(r[B.b]);
   };
-  // Latest battle per team that played since the last run: tracks submission
-  // changes. Ranked battles first: they always use the team's active bot,
-  // while unranked challenges can use any of the requester's submissions.
-  const newest = [...newlyDone].sort((x, y) => y[B.at] - x[B.at]);
-  newest.filter((r) => r[B.ranked]).forEach(addBattle);
-  newest.forEach(addBattle);
-  const incremental = [...want.values()].slice(0, cursor.detailBackfill ? DETAIL_CAP : Math.max(DETAIL_CAP, 800));
-  want.clear();
-  for (const r of incremental) want.set(r[0], r);
+  // Which bot each team is running. Only ranked battles show it (unranked
+  // challenges can use any submission), and a team only needs re-checking
+  // every couple of hours, so each run takes the newest ranked battle of
+  // teams that are due, higher-ranked teams first, up to DETAIL_CAP.
+  const seen = (cursor.botSeen ||= {});
+  const due = (id) => !seen[id] || NOW - seen[id] >= RESAMPLE_AFTER;
+  const rankOf = new Map(teams.map((t) => [t.id, t.ranked ? t.rank : 1e6]));
+  const newestFirst = [...newlyDone].filter((r) => r[B.ranked]).sort((x, y) => y[B.at] - x[B.at]);
+  const latest = new Map(); // team -> its newest ranked battle this run
+  for (const r of newestFirst) for (const id of [r[B.a], r[B.b]]) if (due(id) && !latest.has(id)) latest.set(id, r);
+  const queue = [...latest.entries()].sort((x, y) => rankOf.get(x[0]) - rankOf.get(y[0]));
+  for (const [id, r] of queue) {
+    if (want.size >= DETAIL_CAP) break;
+    if (covered.has(id)) continue;
+    addBattle(r);
+  }
 
   // One-time backfill: sample the top teams' history every few hours so their
   // earlier submissions show up too.
@@ -284,6 +295,7 @@ async function fetchDetails(battles, details, newlyDone, teams, cursor) {
     const req = reqTeam === m.teamAId ? 'a' : reqTeam === m.teamBId ? 'b' : 'x';
     // [subA, subB, games, aId, bId, at, requester]
     details[r[0]] = [m.submissionAId ?? null, m.submissionBId ?? null, games, m.teamAId, m.teamBId, r[B.at], req];
+    if (r[B.ranked]) { seen[m.teamAId] = NOW; seen[m.teamBId] = NOW; }
     ok++;
   }, (n, of) => log(`details ${n}/${of}`));
   log(`details: +${ok} (stored ${Object.keys(details).length})`);
@@ -387,7 +399,7 @@ function fitCalibration(battles, since) {
   };
 }
 
-async function writeOutputs({ teams, tournaments, battles, details }) {
+async function writeOutputs({ teams, tournaments, battles, details, rankLog = {} }) {
   const teamById = new Map(teams.map((t) => [t.id, t]));
   const rowsByTeam = new Map();
   for (const r of battles.values()) for (const id of [r[B.a], r[B.b]]) {
@@ -438,9 +450,10 @@ async function writeOutputs({ teams, tournaments, battles, details }) {
     }
     if (hist.length && hist[hist.length - 1][1] !== t.elo) hist.push([NOW, t.elo]);
     const ranks = (cached?.ranks || []).slice();
-    if (t.ranked && ranks.length && ranks[ranks.length - 1][1] !== t.rank) ranks.push([NOW, t.rank]);
+    for (const p of rankLog[t.id] || []) if (p[0] > since) ranks.push(p);
+    if (t.ranked && (!ranks.length || ranks[ranks.length - 1][1] !== t.rank)) ranks.push([NOW, t.rank]);
     const peak = Math.max(cached?.peak ?? -Infinity, ...hist.map((h) => h[1]));
-    const bestRank = t.ranked ? Math.min(cached?.bestRank ?? Infinity, t.rank) : cached?.bestRank ?? null;
+    const bestRank = Math.min(cached?.bestRank ?? Infinity, ...ranks.map((p) => p[1]));
     const e24 = eloAt(hist, NOW - 86400), e7 = eloAt(hist, NOW - 7 * 86400);
     const obs = obsByTeam.get(t.id) || [];
     const subs = buildSubmissions(t.id, obs, rows);
@@ -566,12 +579,14 @@ async function main() {
     const teams = await readJSON(path.join(STATE, 'leaderboard.json'), null);
     const tournaments = await readJSON(path.join(STATE, 'tournaments.json'), []);
     if (!teams) throw new Error('no saved leaderboard in state; run a normal scrape first');
-    await writeOutputs({ teams, tournaments, battles, details });
+    const rankLog = await readJSON(path.join(STATE, 'ranks.json'), {});
+    await writeOutputs({ teams, tournaments, battles, details, rankLog });
     return;
   }
 
   const teams = await fetchLeaderboard();
   await writeJSON(path.join(STATE, 'leaderboard.json'), teams);
+  const rankLog = await recordRanks(teams);
   const tournaments = await fetchTournaments();
   await writeJSON(path.join(STATE, 'tournaments.json'), tournaments);
   const { maxAt, newlyDone } = await fetchBattles(battles, cursor);
@@ -583,7 +598,7 @@ async function main() {
   await writeJSON(path.join(STATE, 'details.json'), details);
   await writeJSON(path.join(STATE, 'cursor.json'), cursor);
 
-  await writeOutputs({ teams, tournaments, battles, details });
+  await writeOutputs({ teams, tournaments, battles, details, rankLog });
   log(`done: ${stats.requests} requests, ${stats.retries} retries, ${(stats.bytes / 1e6).toFixed(1)} MB`);
 }
 

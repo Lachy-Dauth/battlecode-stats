@@ -907,13 +907,13 @@ function viewAbout() {
     <h3>What's collected</h3>
     <ul>
       <li><b>Leaderboard</b>: every team, rating, record, eligibility tags and ranked-switch setting.</li>
-      <li><b>Team pages</b>: full Elo and rank history for teams whose rating changed since the last run.</li>
+      <li><b>Team pages</b>: read once per team, for its description and the history from before this site started watching. After that, Elo history and records carry forward from the battle log and ranks from the hourly leaderboard.</li>
       <li><b>Battles</b>: every finished battle (ranked and unranked), stored incrementally. ${m.counts.battles.toLocaleString()} so far.</li>
       <li><b>Match details</b> for a sample of battles: which submission each side used and the map for each game. ${m.counts.details.toLocaleString()} sampled.</li>
       <li><b>Tournaments</b>: the Sprint and Qualifiers brackets as currently seeded.</li>
     </ul>
     <h3>Submissions</h3>
-    <p>Other teams' bots can't be downloaded, and the site doesn't list their uploads. It does record, for every match, which submission ID each side played. Each run samples a recent match per active team, preferring ranked battles, so a new bot shows up within a run or two. Ranked battles always use each team's active bot. Unranked challenges can use other submissions for either side, so submissions seen only there are listed separately. A submission's record only counts battles seen with it, plus ranked battles between two sightings of it.</p>
+    <p>Other teams' bots can't be downloaded, and the site doesn't list their uploads. It does record, for every match, which submission ID each side played. Each run checks the newest ranked match of teams not checked in the last two hours, top of the ladder first, so a new bot shows up within about two hours. Ranked battles always use each team's active bot. Unranked challenges can use other submissions for either side, so submissions seen only there are listed separately. A submission's record only counts battles seen with it, plus ranked battles between two sightings of it.</p>
     <h3>Odds</h3>
     <p>Per-game win probability is the Elo expectation 1 / (1 + 10<sup>(R<sub>B</sub> − R<sub>A</sub>)/D</sup>), with D = 400 as on the site or D fitted to recent ranked games. Series odds treat games as independent (draws ignored). Rating changes use the site's rule: K falls from 96 for a new submission to 24 after 10 ranked battles. Tournament odds simulate the site's tentative brackets, which are re-seeded from the ladder after the final autoscrims, so they will shift. The optional rating uncertainty draws each team's strength from Elo ± σ once per simulated season. The Grand Final format is an assumption, noted on that page.</p>
     <h3>Caveats</h3>

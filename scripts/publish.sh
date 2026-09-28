@@ -19,18 +19,24 @@ fi
 
 node scraper/scrape.mjs --state .cache/state --out site/data
 
+# The data branch is always a single commit, but the local copy of it is kept
+# between runs: the previous snapshot is still here when pushing, so git only
+# uploads the files that changed instead of the whole snapshot.
 OUT=.cache/databranch
-rm -rf "$OUT" && mkdir -p "$OUT"
-cp -R .cache/state "$OUT/state"
-cp -R site/data "$OUT/public"
+if [ ! -d "$OUT/.git" ]; then rm -rf "$OUT"; mkdir -p "$OUT"; git -C "$OUT" init -q -b data; fi
+rsync -a --delete .cache/state/ "$OUT/state/"
+rsync -a --delete site/data/ "$OUT/public/"
 (
   cd "$OUT"
-  git init -q -b data
   git add -A
-  git -c user.name="battlecode-stats" -c user.email="battlecode-stats@users.noreply.github.com" \
-    commit -q -m "Data snapshot $(date -u +%Y-%m-%dT%H:%MZ)"
-  git push -q -f "$URL" data
+  commit=$(git -c user.name="battlecode-stats" -c user.email="battlecode-stats@users.noreply.github.com" \
+    commit-tree "$(git write-tree)" -m "Data snapshot $(date -u +%Y-%m-%dT%H:%MZ)")
+  git update-ref refs/heads/data "$commit"
+  if ! out=$(git push --progress -f "$URL" data 2>&1); then echo "$out" >&2; exit 1; fi
+  printf '%s\n' "$out" | tr '\r' '\n' | grep -E "Writing objects: 100%" | tail -1 || true
+  # Drop older snapshots from the local store; the one just pushed stays for next time.
+  git reflog expire --expire=now --all
+  git gc -q --prune=now
 )
-rm -rf "$OUT"
 gh workflow run deploy.yml -R "$REPO" --ref main
 echo "Published $(date)"
