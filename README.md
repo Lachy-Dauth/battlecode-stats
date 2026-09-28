@@ -31,7 +31,7 @@ The accumulated state (every battle seen, plus sampled match details) lives on t
 
 ### Submissions
 
-Other teams' bots and upload lists aren't public. Each match does record which submission ID each side played, so the scraper samples at least one recent match per active team every run. It prefers ranked battles, which always use the team's active bot; unranked challenges can use any of the requester's submissions. The first run also sampled the top teams' history back to the start of the season. A team page lists each active submission ID with the window it was seen in, plus any other submissions seen only in unranked battles the team requested.
+Other teams' bots and upload lists aren't public. Each match does record which submission ID each side played, so the scraper samples at least one recent match per active team every run. It prefers ranked battles, which always use each team's active bot. Unranked challenges can use other submissions for either side. The first run also sampled the top teams' history back to the start of the season. A team page lists each active submission ID with the window it was seen in, plus any other submissions seen only in unranked battles.
 
 ## Local development
 

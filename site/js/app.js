@@ -392,7 +392,7 @@ async function viewTeam(id) {
     <h2>Rank over time</h2>
     <div class="card"><div id="rank-chart"></div></div>
     <h2>Submissions</h2>
-    <p class="muted small">Bots aren't public, but every match records which submission each side used. Active bots come from ranked battles, and from unranked battles the other team asked for. The record counts battles seen with that bot, plus ranked battles between two sightings of it.</p>
+    <p class="muted small">Bots aren't public, but every match records which submission each side used. Active bots come from ranked battles, which always use each team's active submission. The record counts battles seen with that bot, plus ranked battles between two sightings of it.</p>
     <div id="subs"></div>
     <div id="tested"></div>
     <h2>Head to head</h2>
@@ -433,7 +433,7 @@ async function viewTeam(id) {
       <td class="num">${s.ranked ? signed(s.eloDelta) : '<span class="muted">—</span>'} <span class="muted small">${s.ranked ? `(${s.ranked})` : ''}</span></td>
     </tr>`).join('')}</tbody></table></div>` : '<p class="muted">No ranked matches sampled for this team yet.</p>';
   const tested = d?.testedSubmissions || [];
-  $('#tested').innerHTML = tested.length ? `<details style="margin-top:10px"><summary>${tested.length} other submission${tested.length === 1 ? '' : 's'} seen in unranked battles they requested (likely tests)</summary>
+  $('#tested').innerHTML = tested.length ? `<details style="margin-top:10px"><summary>${tested.length} other submission${tested.length === 1 ? '' : 's'} seen only in unranked battles (tests, or opponents picking an older version)</summary>
     <div class="table-wrap" style="margin-top:8px"><table><thead><tr><th>Submission</th><th>First seen</th><th>Last seen</th><th class="num">Battles seen</th><th class="num">Games W–L</th></tr></thead><tbody>
     ${tested.map((x) => `<tr><td>#${x.sub}</td><td class="nowrap">${shortDate(x.first)}</td><td class="nowrap">${shortDate(x.last)}</td><td class="num">${x.battles}</td><td class="num">${x.games[0]}–${x.games[2]}</td></tr>`).join('')}
     </tbody></table></div></details>` : '';
@@ -906,7 +906,7 @@ function viewAbout() {
       <li><b>Tournaments</b>: the Sprint and Qualifiers brackets as currently seeded.</li>
     </ul>
     <h3>Submissions</h3>
-    <p>Other teams' bots can't be downloaded, and the site doesn't list their uploads. It does record, for every match, which submission ID each side played. Each run samples a recent match per active team, preferring ranked battles, so a new bot shows up within a run or two. Ranked battles always use a team's active bot, and so do unranked battles someone else requested. Unranked battles a team requested itself may use any of its submissions, so those appear separately as likely tests. A submission's record only counts battles seen with it, plus ranked battles between two sightings of it.</p>
+    <p>Other teams' bots can't be downloaded, and the site doesn't list their uploads. It does record, for every match, which submission ID each side played. Each run samples a recent match per active team, preferring ranked battles, so a new bot shows up within a run or two. Ranked battles always use each team's active bot. Unranked challenges can use other submissions for either side, so submissions seen only there are listed separately. A submission's record only counts battles seen with it, plus ranked battles between two sightings of it.</p>
     <h3>Odds</h3>
     <p>Per-game win probability is the Elo expectation 1 / (1 + 10<sup>(R<sub>B</sub> − R<sub>A</sub>)/D</sup>), with D = 400 as on the site or D fitted to recent ranked games. Series odds treat games as independent (draws ignored). Rating changes use the site's rule: K falls from 96 for a new submission to 24 after 10 ranked battles. Tournament odds simulate the site's tentative brackets, which are re-seeded from the ladder after the final autoscrims, so they will shift. The optional rating uncertainty draws each team's strength from Elo ± σ once per simulated season. The Grand Final format is an assumption, noted on that page.</p>
     <h3>Caveats</h3>

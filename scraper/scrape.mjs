@@ -397,9 +397,9 @@ async function writeOutputs({ teams, tournaments, battles, details }) {
   }
   for (const rows of rowsByTeam.values()) rows.sort((x, y) => x[B.at] - y[B.at] || x[0] - y[0]);
 
-  // A sighting is "active" when it must be the team's active bot: any ranked
-  // battle, or an unranked one the other side requested. Unranked battles a
-  // team requested itself may use a test submission.
+  // Only ranked battles are guaranteed to use each team's active bot.
+  // Unranked challenges can pit any submission of either team (tests, or an
+  // opponent choosing an older version), so those sightings are kept apart.
   const obsByTeam = new Map();
   const testByTeam = new Map();
   const mapsByTeam = new Map();
@@ -407,7 +407,7 @@ async function writeOutputs({ teams, tournaments, battles, details }) {
     const row = battles.get(Number(bid));
     for (const [tid, sub, side] of [[aId, subA, 'a'], [bId, subB, 'b']]) {
       if (sub == null) continue;
-      const active = row?.[B.ranked] || (req && req !== 'x' && req !== side);
+      const active = !!row?.[B.ranked];
       const target = active ? obsByTeam : testByTeam;
       if (!target.has(tid)) target.set(tid, []);
       target.get(tid).push([at, sub, Number(bid)]);
