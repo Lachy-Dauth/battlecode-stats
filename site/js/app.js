@@ -95,34 +95,41 @@ function parseTeam(str) {
 const teamValue = (t) => (t ? `${t.name} #${t.id}` : '');
 
 function sortable(table, rows, cols, state, renderBody) {
-  // cols: [{key, get}] ; state: {key, dir}
+  // Views re-render (filters, odds arriving) and call this again with new rows;
+  // header handlers are bound once and always read the latest call's data.
+  table._sort = { rows, cols, state, renderBody };
   const head = table.tHead;
   const apply = () => {
-    const col = cols.find((c) => c.key === state.key) || cols[0];
-    const dir = state.dir === 'asc' ? 1 : -1;
-    rows.sort((a, b) => {
+    const { rows: list, cols: cs, state: st, renderBody: body } = table._sort;
+    const col = cs.find((c) => c.key === st.key) || cs[0];
+    const dir = st.dir === 'asc' ? 1 : -1;
+    list.sort((a, b) => {
       const va = col.get(a), vb = col.get(b);
       if (va == null && vb == null) return 0;
       if (va == null) return 1;
       if (vb == null) return -1;
       return (typeof va === 'string' ? va.localeCompare(vb) : va - vb) * dir;
     });
-    $$('th[data-sort]', head).forEach((th) => th.setAttribute('aria-sort', th.dataset.sort === state.key ? (state.dir === 'asc' ? 'ascending' : 'descending') : 'none'));
-    renderBody();
+    $$('th[data-sort]', head).forEach((th) => th.setAttribute('aria-sort', th.dataset.sort === st.key ? (st.dir === 'asc' ? 'ascending' : 'descending') : 'none'));
+    body();
   };
-  $$('th[data-sort]', head).forEach((th) => {
-    th.classList.add('sortable');
-    th.tabIndex = 0;
-    const go = () => {
-      const key = th.dataset.sort;
-      if (state.key === key) state.dir = state.dir === 'asc' ? 'desc' : 'asc';
-      else { state.key = key; state.dir = th.dataset.dir || 'desc'; }
-      apply();
-      state.onChange?.();
-    };
-    th.addEventListener('click', go);
-    th.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } });
-  });
+  if (!table._sortBound) {
+    table._sortBound = true;
+    $$('th[data-sort]', head).forEach((th) => {
+      th.classList.add('sortable');
+      th.tabIndex = 0;
+      const go = () => {
+        const st = table._sort.state;
+        const key = th.dataset.sort;
+        if (st.key === key) st.dir = st.dir === 'asc' ? 'desc' : 'asc';
+        else { st.key = key; st.dir = th.dataset.dir || 'desc'; }
+        apply();
+        st.onChange?.();
+      };
+      th.addEventListener('click', go);
+      th.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } });
+    });
+  }
   apply();
 }
 
