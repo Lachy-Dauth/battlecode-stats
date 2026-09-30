@@ -399,6 +399,13 @@ function fitCalibration(battles, since) {
   };
 }
 
+/** First and last battle times (a loop: there are too many battles to spread into Math.min). */
+function battleSpan(battles) {
+  let lo = Infinity, hi = -Infinity;
+  for (const r of battles.values()) { if (r[B.at] < lo) lo = r[B.at]; if (r[B.at] > hi) hi = r[B.at]; }
+  return [lo, hi];
+}
+
 async function writeOutputs({ teams, tournaments, battles, details, rankLog = {} }) {
   const teamById = new Map(teams.map((t) => [t.id, t]));
   const rowsByTeam = new Map();
@@ -452,8 +459,9 @@ async function writeOutputs({ teams, tournaments, battles, details, rankLog = {}
     const ranks = (cached?.ranks || []).slice();
     for (const p of rankLog[t.id] || []) if (p[0] > since) ranks.push(p);
     if (t.ranked && (!ranks.length || ranks[ranks.length - 1][1] !== t.rank)) ranks.push([NOW, t.rank]);
-    const peak = Math.max(cached?.peak ?? -Infinity, ...hist.map((h) => h[1]));
-    const bestRank = Math.min(cached?.bestRank ?? Infinity, ...ranks.map((p) => p[1]));
+    // Loops, not Math.max(...list): spreading a long list overflows the call stack.
+    const peak = hist.reduce((m, h) => Math.max(m, h[1]), cached?.peak ?? -Infinity);
+    const bestRank = ranks.reduce((m, p) => Math.min(m, p[1]), cached?.bestRank ?? Infinity);
     const e24 = eloAt(hist, NOW - 86400), e7 = eloAt(hist, NOW - 7 * 86400);
     const obs = obsByTeam.get(t.id) || [];
     const subs = buildSubmissions(t.id, obs, rows);
@@ -556,7 +564,7 @@ async function writeOutputs({ teams, tournaments, battles, details, rankLog = {}
     updatedAt: NOW,
     source: 'https://game.battlecode.au',
     counts: { teams: teams.length, rankedTeams: teams.filter((t) => t.ranked).length, battles: battles.size, details: Object.keys(details).length },
-    battleSpan: battles.size ? [Math.min(...[...battles.values()].map((r) => r[B.at])), Math.max(...[...battles.values()].map((r) => r[B.at]))] : null,
+    battleSpan: battles.size ? battleSpan(battles) : null,
     calibration,
     activity: [...hours.entries()].sort((a, b) => a[0] - b[0]).map(([t, [r, u]]) => ({ t, ranked: r, unranked: u })),
     tiers: tierCounts,
