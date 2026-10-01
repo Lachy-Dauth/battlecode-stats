@@ -3,8 +3,9 @@
 An unofficial stats site for [UNSW Battlecode 2026](https://game.battlecode.au), hosted on GitHub Pages: **https://lachy-dauth.github.io/battlecode-stats/**
 
 - **Leaderboard**: by default, only teams with an active bot and the ranked switch on, i.e. the teams you can request ranked battles against. It also shows 24h Elo change, a season trend line, game record, recent activity, switch cooldowns, "new bot" flags, and simulated Sprint and Qualifier odds. You can filter by APAC eligibility, first-year, WGM, UNSW, high school, language, or "teams I can challenge".
-- **Team pages**: full Elo and rank history (with an overlay to compare another team), submission history, head-to-head records, per-map win rates, and recent battles with replay links.
-- **Matchup**: the Elo-implied single-game odds for any two teams or ratings, the distribution of 5-game ranked results, the rating change for each result (using the site's K = 96 → 24 rule), best-of-5 and best-of-7 knockout odds, and whether a ranked challenge is allowed.
+- **Map Elo**: every team's Elo on every map in the ranked pool, as a sortable heatmap over the last 24 hours, 3 days or 7 days, plus the top five on each map. A team's map Elo is its official Elo plus an offset for how it does on that map compared with its other maps, fitted from every ranked and tournament game (see below).
+- **Team pages**: full Elo and rank history (with an overlay to compare another team), submission history, head-to-head records, map Elo, and recent battles with replay links.
+- **Matchup**: the Elo-implied single-game odds for any two teams or ratings, the same odds on each map, the distribution of 5-game ranked results, the rating change for each result (using the site's K = 96 → 24 rule), best-of-5 and best-of-7 knockout odds, and whether a ranked challenge is allowed.
 - **Odds**: a Monte Carlo simulation of the site's actual Sprint and Qualifier brackets, plus the Grand Final. You can use pure Elo or an Elo scale fitted to real results, add rating uncertainty, re-seed the brackets, or override any team's Elo.
 - **Battles**: a live feed with upset detection.
 - **Stats**: Elo calibration (predicted vs. actual game win rate), activity by hour, tier and Elo distributions, movers, languages and countries.
@@ -14,9 +15,12 @@ An unofficial stats site for [UNSW Battlecode 2026](https://game.battlecode.au),
 ```
 scraper/        Node 20+, no dependencies
   lib.mjs       polite fetcher (≈3 req/s, retries, backoff) + SvelteKit devalue decoder
-  scrape.mjs    leaderboard → tournaments → battles → team pages → match details → JSON
+  scrape.mjs    leaderboard → tournaments → battles → team pages → match details → games → JSON
+  rows.mjs      compact row layouts for stored battles and games
+  mapelo.mjs    per-map Elo fit
 scripts/
   publish.sh    scrape, push the snapshot to the `data` branch, trigger a redeploy
+  check-map-elo.mjs   holdout test of the map Elo fit (log-loss vs plain Elo)
 site/           static page, no build step
   js/model.js   Elo maths, series odds, bracket simulator (shared with the worker)
   js/app.js     views + hash router
@@ -38,10 +42,21 @@ The accumulated state (every battle seen, plus sampled match details) lives on t
 | Match details | up to 120 | Which bot each team is running; each team is re-checked at most every 2 hours |
 | Team pages | only new teams | Read once, for the description and the history from before we started watching |
 | Tournaments | ~3 | Brackets |
+| Game list | ~25–60 | Every new game with its map and winner (100 per page), for map Elo |
 
 Team pages are never re-read. Every ranked battle carries the pre-battle Elo and the change, so Elo history and win/loss records carry forward from the battle log exactly, and rank history comes from the leaderboard. The data branch is kept locally between runs, so each push uploads only the files that changed.
 
 Knobs: `DETAIL_CAP` (matches sampled per run, default 120) and `RESAMPLE_H` (hours before a team's bot is re-checked, default 2).
+
+The game list was added later. Its first run reads back `GAMES_BACKFILL_DAYS` (default 3) days of games, newest first, one page at a time: about 3,300 requests and 40 minutes at this season's volume. Pages get slower the deeper they go (page 3,000 took about five times as long as page 1), so a longer backfill costs the site disproportionately; the 7-day window simply fills in as runs accumulate. `--games-only` runs just that step, so it can be done outside the hourly job. The games cursor lives in `state/games-cursor.json`, apart from `cursor.json`, so the games state can be copied between machines on its own.
+
+### Map Elo
+
+`/games` lists every game with its map, so map stats use all of them, not a sample. Its Elo columns are each team's *current* rating, though, so ratings at game time come from the battle log: a battle's id is the id of its first game, which links each ranked game to its battle and that battle's pre-battle Elo.
+
+For a game on map *m*, P(*i* beats *j*) = 1 / (1 + 10^(−(R<sub>i</sub> + μ<sub>i</sub> + η<sub>im</sub> − R<sub>j</sub> − η<sub>jm</sub>)/400)). R is the official rating at the time. μ<sub>i</sub> absorbs a team running ahead of or behind its rating over the window (a new bot still climbing), so that doesn't leak into the maps. η<sub>im</sub> is the map offset, with a normal prior centred on 0 so thin maps stay near the team's usual level. Map Elo = current Elo + η. Only ranked and tournament games count, because unranked challenges can use any submission. While ratings were frozen for the Sprint (1 Oct), ranked battles were listed at 1500 v 1500 with no change; games from those battles use each team's last real rating instead.
+
+`node scripts/check-map-elo.mjs` holds out the latest 12 hours of ranked games, fits on the days before, and compares log-loss with plain Elo across windows and prior widths. On two 12-hour holdouts on 1 Oct (23.7k and 15.2k ranked games), map offsets fitted on the days before cut log-loss from 0.590 to about 0.536 and from 0.548 to about 0.518, and raised the share of games called right from 68.0% to about 73% and from 71.8% to about 74.4%. A prior SD (τ) anywhere from 60 to 120 did about equally well; 80 is used. With no prior at all the gain mostly disappears, which is why the offsets are shrunk. Each run also writes a summary of this check to `maps.json`, and the Maps page shows it.
 
 ### Submissions
 
@@ -55,7 +70,7 @@ npm run serve     # http://localhost:8080
 npm run publish   # scrape + push the data branch + redeploy Pages (needs an authenticated gh)
 ```
 
-Environment knobs for the scraper: `SCRAPER_GAP_MS` (default 350), `SCRAPER_CONCURRENCY` (2), `MAX_BATTLE_PAGES`, `DETAIL_CAP`, `RESAMPLE_H`, `TEAM_PAGE_CAP`.
+Environment knobs for the scraper: `SCRAPER_GAP_MS` (default 350), `SCRAPER_CONCURRENCY` (2), `MAX_BATTLE_PAGES`, `DETAIL_CAP`, `RESAMPLE_H`, `TEAM_PAGE_CAP`, `GAMES_BACKFILL_DAYS` (3), `MAX_GAME_PAGES`.
 
 To refresh hourly, schedule `scripts/publish.sh` with cron or launchd, for example:
 
@@ -68,4 +83,4 @@ To refresh hourly, schedule `scripts/publish.sh` with cron or launchd, for examp
 - This is an unofficial fan site, and all data is already public on game.battlecode.au.
 - Tournament brackets are tentative until the organisers re-seed after the final autoscrims.
 - The Grand Final format isn't published yet. It is modelled as a seeded single-elimination bracket (best of 5), and the site says so.
-- Map and submission stats come from sampled matches.
+- Submission stats come from sampled matches. Map Elo uses every ranked and tournament game since the game list was first read.

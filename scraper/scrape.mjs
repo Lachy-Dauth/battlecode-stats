@@ -3,12 +3,15 @@
 //
 //   node scraper/scrape.mjs --state <dir> --out <dir>
 //
-// <state> keeps what accumulates between runs (every battle seen, sampled
-// match details, cached team pages). <out> is what the site reads.
-// The first run backfills the whole battle history; later runs are incremental.
+// <state> keeps what accumulates between runs (every battle and game seen,
+// sampled match details, cached team pages). <out> is what the site reads.
+// The first run backfills the battle history (and the last few days of games);
+// later runs are incremental.
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { pageData, mapLimit, stats, toSec } from './lib.mjs';
+import { B, G, GK } from './rows.mjs';
+import { mapElo } from './mapelo.mjs';
 
 const args = Object.fromEntries(process.argv.slice(2).reduce((acc, a, i, all) => {
   if (a.startsWith('--')) acc.push([a.slice(2), all[i + 1] && !all[i + 1].startsWith('--') ? all[i + 1] : true]);
@@ -24,6 +27,8 @@ const BACKFILL_DETAIL_CAP = env('BACKFILL_DETAIL_CAP', 900);
 const BACKFILL_TEAMS = env('BACKFILL_TEAMS', 100);        // teams whose submission history is backfilled
 const BACKFILL_SPACING = env('BACKFILL_SPACING_H', 8) * 3600;
 const TEAM_PAGE_CAP = env('TEAM_PAGE_CAP', Infinity);
+const GAMES_BACKFILL_DAYS = env('GAMES_BACKFILL_DAYS', 3); // how far back the first games run reads (deep pages are slow for the site)
+const MAX_GAME_PAGES = env('MAX_GAME_PAGES', 12000);      // games ceiling per run (100 games/page)
 const OVERLAP = 30 * 60;                                  // re-read this much before the cursor
 
 const NOW = Math.floor(Date.now() / 1000);
@@ -38,9 +43,7 @@ async function writeJSON(file, data) {
   await fs.writeFile(file, JSON.stringify(data));
 }
 
-// Battle rows are stored compactly, one file per UTC day.
-// [id, at, ranked, challenge, aId, bId, aElo, bElo, winsA, winsB, games, dA, dB, replayId]
-const B = { id: 0, at: 1, ranked: 2, challenge: 3, a: 4, b: 5, aElo: 6, bElo: 7, wa: 8, wb: 9, n: 10, dA: 11, dB: 12, replay: 13 };
+// Battle and game rows are stored compactly, one file per UTC day (see rows.mjs).
 const DONE = new Set(['a', 'b', 'draw']);
 
 function battleRow(x) {
@@ -49,26 +52,32 @@ function battleRow(x) {
     x.eloChangeA ?? 0, x.eloChangeB ?? 0, x.replayId ?? x.id];
 }
 
-async function loadBattles() {
-  const dir = path.join(STATE, 'battles');
+const dayOf = (t) => new Date(t * 1000).toISOString().slice(0, 10);
+
+async function loadRows(kind) {
+  const dir = path.join(STATE, kind);
   const map = new Map();
   let files = [];
   try { files = (await fs.readdir(dir)).filter((f) => f.endsWith('.json')).sort(); } catch {}
   for (const f of files) for (const r of await readJSON(path.join(dir, f), [])) map.set(r[0], r);
   return map;
 }
-async function saveBattles(map) {
+/** Write the day files; with `days`, only those days (the rest are unchanged on disk). */
+async function saveRows(kind, map, days) {
   const byDay = new Map();
   for (const r of map.values()) {
-    const day = new Date(r[B.at] * 1000).toISOString().slice(0, 10);
+    const day = dayOf(r[1]);
+    if (days && !days.has(day)) continue;
     if (!byDay.has(day)) byDay.set(day, []);
     byDay.get(day).push(r);
   }
   for (const [day, rows] of byDay) {
-    rows.sort((x, y) => x[B.at] - y[B.at] || x[0] - y[0]);
-    await writeJSON(path.join(STATE, 'battles', `${day}.json`), rows);
+    rows.sort((x, y) => x[1] - y[1] || x[0] - y[0]);
+    await writeJSON(path.join(STATE, kind, `${day}.json`), rows);
   }
 }
+const loadBattles = () => loadRows('battles');
+const saveBattles = (map) => saveRows('battles', map);
 
 // ---- 1. leaderboard ---------------------------------------------------------
 async function fetchLeaderboard() {
@@ -303,7 +312,69 @@ async function fetchDetails(battles, details, newlyDone, teams, cursor) {
   if (!cursor.rankedBackfill) cursor.rankedBackfill = NOW;
 }
 
-// ---- 6. derived outputs -------------------------------------------------------------
+// ---- 6. games (every game, with its map) --------------------------------------------
+// The battle list doesn't say which maps were played. /games lists every game
+// with its map and winner, 100 to a page, newest first. (Its Elo columns are
+// each team's *current* rating, so mapelo.mjs takes ratings at game time from
+// the battle log instead.) A game's `at` is when it was queued, so it can
+// still be running when we pass it: the next run starts from the oldest game
+// that wasn't finished yet, as well as from the newest one seen.
+const OPEN_FOR = 6 * 3600;  // stop waiting for a game that's been unfinished this long
+const GAME_DONE = new Set(['completed']);
+const GAME_DEAD = new Set(['failed', 'error', 'errored', 'cancelled', 'canceled', 'aborted']);
+
+function gameRow(g, mapIds) {
+  return [g.id, toSec(g.at),
+    (g.ranked ? GK.ranked : 0) | (g.challenge ? GK.challenge : 0) | (g.tournament ? GK.tournament : 0),
+    g.a?.id ?? null, g.b?.id ?? null, mapIds.get(g.mapName) ?? null,
+    g.winner === 'a' ? 1 : g.winner === 'b' ? 2 : 0];
+}
+
+async function fetchGames(games, gcur) {
+  const mapIds = new Map((gcur.maps || []).map((m) => [m.name, m.id]));
+  const backfill = !gcur.lastAt;
+  const since = backfill ? NOW - GAMES_BACKFILL_DAYS * 86400
+    : Math.min(gcur.lastAt, gcur.openFrom ?? Infinity) - OVERLAP;
+  const days = new Set();
+  let maxAt = gcur.lastAt || 0, openFrom = Infinity, added = 0, pages = 0, complete = false;
+  // Pages are read strictly in order. New games push older ones to later
+  // pages, so reading in order can repeat a game but never skip one.
+  try {
+    for (let p = 1; p <= MAX_GAME_PAGES; p++) {
+      const d = await pageData(p === 1 ? '/games' : `/games?page=${p}`, { list: 'games' });
+      pages++;
+      for (const m of d.maps || []) if (!mapIds.has(m.name)) mapIds.set(m.name, m.id);
+      let oldest = Infinity;
+      for (const g of d.matches || []) {
+        const at = toSec(g.at);
+        if (at < oldest) oldest = at;
+        if (at > maxAt) maxAt = at;
+        if (!GAME_DONE.has(g.status)) {
+          if (!GAME_DEAD.has(g.status) && at < openFrom) openFrom = at;
+          continue;
+        }
+        if (games.has(g.id)) continue;
+        games.set(g.id, gameRow(g, mapIds));
+        days.add(dayOf(at));
+        added++;
+      }
+      if (!d.matches?.length || oldest < since) { complete = true; break; }
+      if (backfill && pages % 250 === 0) log(`games backfill: ${pages} pages, back to ${new Date(oldest * 1000).toISOString()}`);
+    }
+  } catch (err) {
+    log(`games: stopped at page ${pages + 1}: ${err.message}`);
+  }
+  // Only move the cursor after a full walk; otherwise the next run covers the gap.
+  if (complete) {
+    gcur.lastAt = maxAt;
+    gcur.openFrom = openFrom >= maxAt - OPEN_FOR && openFrom < maxAt ? openFrom : null;
+  }
+  gcur.maps = [...mapIds].map(([name, id]) => ({ id, name })).sort((a, b) => a.id - b.id);
+  log(`games: read ${pages} pages, +${added} completed (stored ${games.size})${complete ? '' : ', incomplete'}`);
+  return days;
+}
+
+// ---- 7. derived outputs -------------------------------------------------------------
 const TIERS = [[2800, 'Fishing Boat'], [2500, 'Leviathan'], [2200, 'Orca'], [1900, 'Shark'],
   [1600, 'Swordfish'], [1300, 'Tunafish'], [1000, 'Shrimp'], [-Infinity, 'Plankton']];
 
@@ -406,7 +477,7 @@ function battleSpan(battles) {
   return [lo, hi];
 }
 
-async function writeOutputs({ teams, tournaments, battles, details, rankLog = {} }) {
+async function writeOutputs({ teams, tournaments, battles, details, rankLog = {}, games = new Map(), gcur = {} }) {
   const teamById = new Map(teams.map((t) => [t.id, t]));
   const rowsByTeam = new Map();
   for (const r of battles.values()) for (const id of [r[B.a], r[B.b]]) {
@@ -421,21 +492,14 @@ async function writeOutputs({ teams, tournaments, battles, details, rankLog = {}
   // opponent choosing an older version), so those sightings are kept apart.
   const obsByTeam = new Map();
   const testByTeam = new Map();
-  const mapsByTeam = new Map();
-  for (const [bid, [subA, subB, games, aId, bId, at, req]] of Object.entries(details)) {
+  for (const [bid, [subA, subB, , aId, bId, at]] of Object.entries(details)) {
     const row = battles.get(Number(bid));
-    for (const [tid, sub, side] of [[aId, subA, 'a'], [bId, subB, 'b']]) {
+    for (const [tid, sub] of [[aId, subA], [bId, subB]]) {
       if (sub == null) continue;
       const active = !!row?.[B.ranked];
       const target = active ? obsByTeam : testByTeam;
       if (!target.has(tid)) target.set(tid, []);
       target.get(tid).push([at, sub, Number(bid)]);
-      if (!mapsByTeam.has(tid)) mapsByTeam.set(tid, {});
-      const m = mapsByTeam.get(tid);
-      for (const [map, winner] of games) {
-        m[map] ??= [0, 0, 0];
-        m[map][winner === side ? 0 : winner === 'draw' || winner == null ? 1 : 2]++;
-      }
     }
   }
   for (const o of obsByTeam.values()) o.sort((x, y) => x[0] - y[0]);
@@ -521,8 +585,6 @@ async function writeOutputs({ teams, tournaments, battles, details, rankLog = {}
       history: hist, ranks,
       submissions: subs,
       testedSubmissions: [...tested.values()].sort((a, b) => b.last - a.last),
-      maps: Object.entries(mapsByTeam.get(t.id) || {}).map(([map, [w, d, l]]) => ({ map, w, d, l }))
-        .sort((a, b) => (b.w + b.d + b.l) - (a.w + a.d + a.l)),
       h2h: [...h2h.values()].sort((a, b) => b.last - a.last),
       battles: rows.slice(-150).reverse().map((r) => ({ id: r[0], at: r[B.at], ranked: !!r[B.ranked], challenge: !!r[B.challenge],
         replay: r[B.replay], sub: details[r[0]] ? details[r[0]][r[B.a] === t.id ? 0 : 1] : undefined, ...perspective(r, t.id) })),
@@ -531,6 +593,13 @@ async function writeOutputs({ teams, tournaments, battles, details, rankLog = {}
     await writeJSON(path.join(OUT, 'teams', `${t.id}.json`), detail);
   }
   await writeJSON(path.join(OUT, 'teams.json'), outTeams);
+
+  // Per-map Elo from every ranked and tournament game (see mapelo.mjs).
+  const maps = games.size ? mapElo({ games, battles, gcur, now: NOW }) : null;
+  if (maps) {
+    await writeJSON(path.join(OUT, 'maps.json'), maps.payload);
+    log(`map Elo: ${maps.payload.maps.length} maps; ${maps.meta.linked}/${maps.meta.rankedGames} ranked games linked to their battle, ${maps.meta.unrated} unrated`);
+  }
 
   // Tournaments + Grand Final (the site lists it but has no bracket page for it yet).
   await writeJSON(path.join(OUT, 'tournaments.json'), {
@@ -563,7 +632,9 @@ async function writeOutputs({ teams, tournaments, battles, details, rankLog = {}
   const meta = {
     updatedAt: NOW,
     source: 'https://game.battlecode.au',
-    counts: { teams: teams.length, rankedTeams: teams.filter((t) => t.ranked).length, battles: battles.size, details: Object.keys(details).length },
+    counts: { teams: teams.length, rankedTeams: teams.filter((t) => t.ranked).length, battles: battles.size, games: games.size, details: Object.keys(details).length },
+    gamesSince: games.size ? [...games.values()].reduce((m, g) => Math.min(m, g[G.at]), Infinity) : null,
+    mapElo: maps?.meta ?? null,
     battleSpan: battles.size ? battleSpan(battles) : null,
     calibration,
     activity: [...hours.entries()].sort((a, b) => a[0] - b[0]).map(([t, [r, u]]) => ({ t, ranked: r, unranked: u })),
@@ -580,7 +651,19 @@ async function main() {
   const cursor = await readJSON(path.join(STATE, 'cursor.json'), {});
   const battles = await loadBattles();
   const details = await readJSON(path.join(STATE, 'details.json'), {});
-  log(`state: ${battles.size} battles, ${Object.keys(details).length} details, cursor ${cursor.lastAt ? new Date(cursor.lastAt * 1000).toISOString() : 'none'}`);
+  const games = await loadRows('games');
+  // Kept apart from cursor.json so the games state can be copied on its own.
+  const gcur = await readJSON(path.join(STATE, 'games-cursor.json'), {});
+  log(`state: ${battles.size} battles, ${games.size} games, ${Object.keys(details).length} details, cursor ${cursor.lastAt ? new Date(cursor.lastAt * 1000).toISOString() : 'none'}`);
+
+  if (args['games-only']) {
+    // Just the games list (e.g. to backfill it on its own); no outputs.
+    const gameDays = await fetchGames(games, gcur);
+    await saveRows('games', games, gameDays);
+    await writeJSON(path.join(STATE, 'games-cursor.json'), gcur);
+    log(`done: ${stats.requests} requests, ${stats.retries} retries, ${(stats.bytes / 1e6).toFixed(1)} MB`);
+    return;
+  }
 
   if (args['derive-only']) {
     // Rebuild the site's JSON from saved state without touching the network.
@@ -588,7 +671,7 @@ async function main() {
     const tournaments = await readJSON(path.join(STATE, 'tournaments.json'), []);
     if (!teams) throw new Error('no saved leaderboard in state; run a normal scrape first');
     const rankLog = await readJSON(path.join(STATE, 'ranks.json'), {});
-    await writeOutputs({ teams, tournaments, battles, details, rankLog });
+    await writeOutputs({ teams, tournaments, battles, details, rankLog, games, gcur });
     return;
   }
 
@@ -605,8 +688,11 @@ async function main() {
   await fetchDetails(battles, details, newlyDone, teams, cursor);
   await writeJSON(path.join(STATE, 'details.json'), details);
   await writeJSON(path.join(STATE, 'cursor.json'), cursor);
+  const gameDays = await fetchGames(games, gcur);
+  await saveRows('games', games, gameDays);
+  await writeJSON(path.join(STATE, 'games-cursor.json'), gcur);
 
-  await writeOutputs({ teams, tournaments, battles, details, rankLog });
+  await writeOutputs({ teams, tournaments, battles, details, rankLog, games, gcur });
   log(`done: ${stats.requests} requests, ${stats.retries} retries, ${(stats.bytes / 1e6).toFixed(1)} MB`);
 }
 

@@ -405,7 +405,7 @@ async function viewTeam(id) {
     <h2>Head to head</h2>
     <div id="h2h"></div>
     <div class="grid2">
-      <div><h2>Maps <span class="muted small">(sampled matches)</span></h2><div id="maps"></div></div>
+      <div><h2>Map Elo</h2><div id="maps"><p class="muted">Loading…</p></div></div>
       <div><h2>Recent battles</h2><div id="recent"></div></div>
     </div>`;
 
@@ -479,11 +479,7 @@ async function viewTeam(id) {
   } else $('#h2h').innerHTML = '<p class="muted">No battles recorded yet.</p>';
 
   // Maps
-  const maps = d?.maps || [];
-  $('#maps').innerHTML = maps.length ? `<div class="card">${hbars(maps.map((m) => ({
-    label: m.map, value: winPct(m.w, m.l) ?? 0, title: `${m.w} W · ${m.d} D · ${m.l} L`,
-    cls: 's1',
-  })), { max: 1, fmt: (v) => pct(v, 0) })}<p class="muted small">Game win rate per map across ${maps.reduce((s, m) => s + m.w + m.d + m.l, 0)} sampled games.</p></div>` : '<p class="muted">No sampled games yet.</p>';
+  teamMaps(t);
 
   // Recent battles
   const bl = (d?.battles || []).slice(0, 40);
@@ -568,7 +564,9 @@ function viewMatchup(params) {
       ${A && B ? `<div class="card"><h3>Can they request a ranked battle?</h3>
         <p>${esc(A.name)} → ${esc(B.name)}: ${allowAB ? '<span class="ok">Allowed</span>' : '<span class="no">Not allowed</span>'} · ${esc(B.name)} → ${esc(A.name)}: ${allowBA ? '<span class="ok">Allowed</span>' : '<span class="no">Not allowed</span>'}</p>
         <p class="muted small">Both teams need an active bot and the ranked switch on, and the target may be at most 50 below the challenger. Switches: ${esc(A.name)} ${switchCell(A)} · ${esc(B.name)} ${switchCell(B)}</p></div>
+        <div class="card" id="mmaps"><h3>By map</h3><p class="muted">Loading…</p></div>
         <div class="card" id="mh2h"><h3>History</h3><p class="muted">Loading…</p></div>` : ''}`;
+    if (A && B) matchupMaps(A, B, st.eloA, st.eloB, st.D);
     if (A && B) teamDetail(A.id).then((d) => {
       const box = $('#mh2h');
       if (!box) return;
@@ -898,6 +896,255 @@ function calibrationChart(host, cal) {
   new ResizeObserver(draw).observe(host);
 }
 
+// ---- maps -------------------------------------------------------------------------
+// maps.json holds, for each time window and team, an offset per map: how much
+// better or worse the team does there than on its other maps (scraper/mapelo.mjs).
+// A cell is [offset, standard error, wins, draws, losses], or null if unplayed.
+function mapData() {
+  if (!S.mapsP) S.mapsP = getJSON('maps.json').catch(() => null);
+  return S.mapsP;
+}
+const OFFSET_CAP = 200; // offsets this far from 0 get the full colour (about the top 5%)
+/** Cell fill: blue where a team does better than usual on a map, red where worse, grey at 0. */
+function offsetFill(eta) {
+  const a = Math.min(Math.abs(eta) / OFFSET_CAP, 1);
+  return `color-mix(in oklab, var(${eta >= 0 ? '--div-pos' : '--div-neg'}) ${Math.round(a * 62)}%, var(--div-mid))`;
+}
+const plainSigned = (n) => (n > 0 ? `+${n}` : n < 0 ? `−${-n}` : '0');
+const cellGames = (c) => (c ? c[2] + c[3] + c[4] : 0);
+const mapPrefs = (M) => Object.assign({ win: M?.defaultWindow ?? '3d', scope: 'on', q: '', show: 'elo', min: 10, apac: false }, store.get('mapFilters', {}));
+const pickWindow = (M, key) => (M.teams[key] ? key : M.windows[Math.min(1, M.windows.length - 1)].key);
+
+function mapTipHtml(t, elo, map, c, min) {
+  if (!c) return `<div class="tip-h">${esc(t.name)} · ${esc(map.name)}</div>No ranked games on this map in the window.`;
+  const n = cellGames(c);
+  return `<div class="tip-h">${esc(t.name)} · ${esc(map.name)}</div>
+    <b>${elo + c[0]}</b> map Elo: ${plainSigned(c[0])} vs their usual (± ${c[1]})<br>
+    ${c[2]}–${c[3]}–${c[4]} W–D–L in ${n} game${n === 1 ? '' : 's'} · ${pct(winPct(c[2], c[4]), 0)} won
+    ${n < min ? `<div class="muted">Fewer than ${min} games, so this leans on the prior.</div>` : ''}`;
+}
+
+/** One floating tooltip for map cells/bars; `html(el)` builds the content for a hovered element. */
+function bindMapTip(host, selector, html) {
+  let tip = $('#maptip');
+  if (!tip) {
+    tip = document.createElement('div');
+    tip.id = 'maptip';
+    tip.className = 'tip maptip';
+    document.body.appendChild(tip);
+    const hide = () => { tip.style.display = 'none'; };
+    addEventListener('scroll', hide, { passive: true, capture: true });
+    addEventListener('hashchange', hide);
+  }
+  tip.style.display = 'none';
+  host.addEventListener('pointermove', (e) => {
+    const el = e.target.closest(selector);
+    if (!el || !host.contains(el)) { tip.style.display = 'none'; return; }
+    tip.innerHTML = html(el);
+    tip.style.display = 'block';
+    const r = tip.getBoundingClientRect();
+    const x = e.clientX + 14 + r.width > innerWidth ? e.clientX - 14 - r.width : e.clientX + 14;
+    const y = e.clientY + 14 + r.height > innerHeight ? e.clientY - 14 - r.height : e.clientY + 14;
+    tip.style.left = `${Math.max(4, x)}px`;
+    tip.style.top = `${Math.max(4, y)}px`;
+  });
+  host.addEventListener('pointerleave', () => { tip.style.display = 'none'; });
+}
+
+async function viewMaps() {
+  main.innerHTML = '<h1>Map Elo</h1><div class="progress"><div></div></div>';
+  const M = await mapData();
+  if (location.hash.split('?')[0] !== '#/maps') return;
+  if (!M?.maps?.length) { main.innerHTML = '<h1>Map Elo</h1><p class="muted">No map data yet. It appears after the next data update.</p>'; return; }
+  const f = mapPrefs(M);
+  f.win = pickWindow(M, f.win);
+  const sort = Object.assign({ key: 'elo', dir: 'desc' }, store.get('mapSort', {}));
+  const me = myTeam();
+  const maps = M.maps;
+  const check = M.check;
+
+  main.innerHTML = `
+    <h1>Map Elo</h1>
+    <p class="lede">Each team's Elo on each map: its current Elo, plus how much better or worse it does on that map than on its others.
+    Offsets are fitted from every ranked and tournament game in the window. <b class="ink2">Blue</b> means stronger than usual on that map, <b class="ink2">red</b> weaker. Hover a cell to see the record behind it.</p>
+    <div class="controls" role="group" aria-label="Filters">
+      <div class="seg" id="mw" role="group" aria-label="Time window">${M.windows.map((w) => `<button data-w="${w.key}">${esc(w.label.replace(/^Last /, ''))}</button>`).join('')}</div>
+      <div class="seg" id="ms" role="group" aria-label="Which teams"><button data-scope="on" title="Active bot and ranked switch on">Ranked on</button><button data-scope="rated">Has rating</button><button data-scope="all">All teams</button></div>
+      <input type="search" id="mq" placeholder="Search team…" value="${esc(f.q)}">
+      <div class="seg" id="mv" role="group" aria-label="Show"><button data-v="elo">Map Elo</button><button data-v="off" title="Map Elo minus official Elo">vs usual</button></div>
+      <label>Fade under <select id="mmin">${[1, 5, 10, 20, 40].map((n) => `<option value="${n}" ${n === f.min ? 'selected' : ''}>${n} games</option>`).join('')}</select></label>
+      <label class="chip"><input type="checkbox" id="mapac" ${f.apac ? 'checked' : ''}>APAC eligible</label>
+    </div>
+    <div class="controls" style="margin-top:-4px">
+      <span class="ramp-legend"><span>−${OFFSET_CAP} worse</span><span class="ramp" aria-hidden="true"></span><span>+${OFFSET_CAP} better than usual</span></span>
+      <span class="muted small" id="mcount"></span>
+    </div>
+    <div class="table-wrap"><table id="mt" class="heat">
+      <thead><tr>
+        <th data-sort="rank" data-dir="asc" class="num hide-sm">#</th>
+        <th data-sort="name" data-dir="asc" class="sticky">Team</th>
+        <th data-sort="elo" class="num" title="Official Elo">Elo</th>
+        ${maps.map((m, i) => `<th data-sort="m${i}" class="map">${esc(m.name)}<span class="muted" id="mg${i}"></span></th>`).join('')}
+        <th data-sort="spread" class="num hide-sm" title="Best map minus worst map, counting maps with enough games">Spread</th>
+      </tr></thead><tbody></tbody></table></div>
+    <h2>Best on each map</h2>
+    <div class="leaders" id="leaders"></div>
+    <details style="margin-top:18px"><summary>How map Elo is worked out</summary><div class="card" style="margin-top:8px">
+      <p style="margin-top:0">For a game on map <i>m</i>, the chance that team <i>i</i> beats team <i>j</i> is modelled as 1 / (1 + 10<sup>−(R<sub>i</sub> + μ<sub>i</sub> + η<sub>im</sub> − R<sub>j</sub> − η<sub>jm</sub>)/${M.D}</sup>),
+      where R is each team's official Elo when the game was played (from the battle it belongs to).
+      μ<sub>i</sub> absorbs how far a team ran ahead of or behind its rating over the window (a new bot still climbing, say), so that doesn't leak into the maps.
+      η<sub>im</sub> is the map offset. It is shrunk towards 0 (a normal prior with SD ${M.tau}), so a map with only a few games stays close to the team's usual level, and the ± in each tooltip is its standard error.
+      <b>Map Elo = current official Elo + η.</b></p>
+      <p>Only ranked and tournament games count. Unranked challenges can use any submission on either side, not the team's active bot.
+      Every game is used, not a sample: the site lists all games with their maps.</p>
+      ${check ? `<p><b>Does it predict anything?</b> On the ${check.games.toLocaleString()} ranked games of the last ${Math.round(check.hours)} hours, with offsets fitted on the ${esc(check.window)} before them:
+      plain Elo had log-loss ${check.base.toFixed(4)} (${pct(check.baseAcc, 1)} of games called right). Adding both teams' map offsets gave ${check.model.toFixed(4)} (${pct(check.modelAcc, 1)}). Lower log-loss is better.</p>` : ''}
+    </div></details>`;
+
+  const save = () => store.set('mapFilters', f);
+  const segs = (sel, attr, key) => {
+    const btns = $$(`${sel} button`);
+    btns.forEach((b) => {
+      b.setAttribute('aria-pressed', String(b.dataset[attr] === f[key]));
+      b.onclick = () => { f[key] = b.dataset[attr]; save(); btns.forEach((x) => x.setAttribute('aria-pressed', String(x === b))); render(); };
+    });
+  };
+  segs('#mw', 'w', 'win');
+  segs('#ms', 'scope', 'scope');
+  segs('#mv', 'v', 'show');
+  $('#mq').oninput = (e) => { f.q = e.target.value; save(); render(); };
+  $('#mmin').onchange = (e) => { f.min = Number(e.target.value); save(); render(); };
+  $('#mapac').onchange = (e) => { f.apac = e.target.checked; save(); render(); };
+
+  const table = $('#mt');
+  const tbody = table.tBodies[0];
+  let rows = [];
+  const ok = (c) => c && cellGames(c) >= f.min;
+  const spreadOf = (r) => {
+    const v = r.cells.filter(ok).map((c) => c[0]);
+    return v.length >= 2 ? Math.max(...v) - Math.min(...v) : null;
+  };
+  const cols = [
+    { key: 'rank', get: (r) => (r.t.ranked ? r.t.rank : null) },
+    { key: 'name', get: (r) => r.t.name.toLowerCase() },
+    { key: 'elo', get: (r) => r.t.elo },
+    ...maps.map((m, i) => ({ key: `m${i}`, get: (r) => (ok(r.cells[i]) ? (f.show === 'off' ? 0 : r.t.elo) + r.cells[i][0] : null) })),
+    { key: 'spread', get: spreadOf },
+  ];
+  const renderBody = () => {
+    tbody.innerHTML = rows.length ? rows.map((r) => `<tr class="clickable${me && r.t.id === me.id ? ' me' : ''}" data-id="${r.t.id}">
+      <td class="num hide-sm">${r.t.ranked ? r.t.rank : '<span class="muted">—</span>'}</td>
+      <td class="team sticky">${teamLink(r.t.id, r.t.name)}</td>
+      <td class="num"><b>${r.t.elo}</b></td>
+      ${r.cells.map((c, i) => {
+        if (!c) return '<td class="cell none"><span>—</span></td>';
+        const thin = cellGames(c) < f.min;
+        const v = f.show === 'off' ? plainSigned(c[0]) : r.t.elo + c[0];
+        return `<td class="cell${thin ? ' thin' : ''}" data-i="${i}"${thin ? '' : ` style="background:${offsetFill(c[0])}"`}><span>${v}</span></td>`;
+      }).join('')}
+      <td class="num hide-sm">${spreadOf(r) ?? '<span class="muted">—</span>'}</td>
+    </tr>`).join('') : `<tr><td colspan="${maps.length + 4}" class="empty muted">No teams with games in this window match these filters.</td></tr>`;
+  };
+  tbody.onclick = (e) => {
+    if (e.target.closest('a')) return;
+    const tr = e.target.closest('tr[data-id]');
+    if (tr) location.hash = `#/team/${tr.dataset.id}`;
+  };
+  bindMapTip(tbody, 'td.cell[data-i]', (el) => {
+    const t = S.byId.get(Number(el.closest('tr').dataset.id));
+    const i = Number(el.dataset.i);
+    return mapTipHtml(t, t.elo, maps[i], M.teams[f.win][t.id]?.cells[i], f.min);
+  });
+  sort.onChange = () => store.set('mapSort', { key: sort.key, dir: sort.dir });
+
+  function render() {
+    const wi = M.windows.findIndex((w) => w.key === f.win);
+    const data = M.teams[f.win];
+    const q = f.q.trim().toLowerCase();
+    rows = S.teams.filter((t) => {
+      if (!data[t.id]) return false;
+      if (f.scope === 'on' && !(t.accepting && t.hasBot)) return false;
+      if (f.scope === 'rated' && !t.ranked) return false;
+      if (f.apac && !t.eligible) return false;
+      if (q && !`${t.name} ${t.members.join(' ')}`.toLowerCase().includes(q)) return false;
+      return true;
+    }).map((t) => ({ t, cells: data[t.id].cells, mu: data[t.id].mu }));
+    maps.forEach((m, i) => { $(`#mg${i}`).textContent = `${m.games[wi].toLocaleString()} games`; });
+    const w = M.windows[wi];
+    $('#mcount').textContent = `${rows.length} team${rows.length === 1 ? '' : 's'} · ${w.games.toLocaleString()} games ${w.partial ? `since ${shortDate(w.from)}, when collection started` : 'in the window'}`;
+    sortable(table, rows, cols, sort, renderBody);
+    // Leaders: top five on each map among the teams shown, with enough games there.
+    $('#leaders').innerHTML = maps.map((m, i) => {
+      const top = rows.filter((r) => ok(r.cells[i])).sort((a, b) => (b.t.elo + b.cells[i][0]) - (a.t.elo + a.cells[i][0])).slice(0, 5);
+      return `<div class="card"><h3 style="margin:0">${esc(m.name)}</h3><div class="muted small">${m.games[wi].toLocaleString()} games</div>
+        ${top.length ? `<ol>${top.map((r, k) => `<li><span class="rk">${k + 1}</span>${teamLink(r.t.id, r.t.name)}<span class="num">${r.t.elo + r.cells[i][0]} <span class="muted small">${plainSigned(r.cells[i][0])}</span></span></li>`).join('')}</ol>` : '<p class="muted small">No team with enough games.</p>'}</div>`;
+    }).join('');
+  }
+  render();
+}
+
+/** Team page: map Elo as bars around the team's usual level. */
+async function teamMaps(t) {
+  const host = $('#maps');
+  const M = await mapData();
+  if (!host.isConnected) return;
+  if (!M?.maps?.length) { host.innerHTML = '<p class="muted">No map data yet.</p>'; return; }
+  const f = mapPrefs(M);
+  let win = pickWindow(M, store.get('teamMapWin', f.win));
+  const draw = () => {
+    const data = M.teams[win]?.[t.id];
+    const rows = M.maps.map((m, i) => ({ m, i, c: data?.cells[i] ?? null }))
+      .sort((a, b) => (b.c ? b.c[0] : -1e9) - (a.c ? a.c[0] : -1e9));
+    host.innerHTML = `<div class="card">
+      <div class="controls" style="margin-top:0"><div class="seg" role="group" aria-label="Time window">${M.windows.map((w) =>
+        `<button data-w="${w.key}" aria-pressed="${w.key === win}">${esc(w.label.replace(/^Last /, ''))}</button>`).join('')}</div></div>
+      ${data ? `<div class="mbars">
+        <div class="mbar head"><span>Map</span><span style="text-align:center;white-space:nowrap">← worse · better →</span><span style="text-align:right">Map Elo</span><span style="text-align:right">W–L</span></div>
+        ${rows.map(({ m, i, c }) => {
+          if (!c) return `<div class="mbar"><div class="lab">${esc(m.name)}</div><div class="track"></div><div class="val muted">—</div><div class="rec">0–0</div></div>`;
+          const thin = cellGames(c) < f.min;
+          const w = (Math.min(Math.abs(c[0]) / OFFSET_CAP, 1) * 50).toFixed(1);
+          return `<div class="mbar" data-i="${i}"><div class="lab">${esc(m.name)}</div>
+            <div class="track"><div class="fill ${c[0] >= 0 ? 'pos' : 'neg'}${thin ? ' thin' : ''}" style="width:${w}%"></div></div>
+            <div class="val"><b>${t.elo + c[0]}</b> <span class="muted small">${plainSigned(c[0])}</span></div>
+            <div class="rec">${c[2]}–${c[4]}</div></div>`;
+        }).join('')}</div>
+        <p class="muted small" style="margin-bottom:0">Ranked and tournament games only, every game counted. Faded bars have fewer than ${f.min} games. <a href="#/maps">All teams →</a></p>`
+        : '<p class="muted">No ranked games in this window.</p>'}
+    </div>`;
+    $$('.seg button', host).forEach((b) => { b.onclick = () => { win = b.dataset.w; store.set('teamMapWin', win); draw(); }; });
+  };
+  draw();
+  bindMapTip(host, '.mbar[data-i]', (el) => {
+    const i = Number(el.dataset.i);
+    return mapTipHtml(t, t.elo, M.maps[i], M.teams[win]?.[t.id]?.cells[i], f.min);
+  });
+}
+
+/** Matchup: single-game odds on each map, from both teams' map offsets. */
+async function matchupMaps(A, B, eloA, eloB, D) {
+  const M = await mapData();
+  const box = $('#mmaps');
+  if (!box) return;
+  const win = pickWindow(M || { teams: {}, windows: [{ key: '3d' }] }, mapPrefs(M).win);
+  const a = M?.teams[win]?.[A.id], b = M?.teams[win]?.[B.id];
+  if (!M?.maps?.length || !a || !b) { box.innerHTML = '<h3>By map</h3><p class="muted">Not enough map data for these two teams in the window.</p>'; return; }
+  const w = M.windows.find((x) => x.key === win);
+  const rows = M.maps.map((m, i) => {
+    const ea = a.cells[i]?.[0] ?? 0, eb = b.cells[i]?.[0] ?? 0;
+    return { m, ea, eb, na: cellGames(a.cells[i]), nb: cellGames(b.cells[i]), p: expected(eloA + ea, eloB + eb, D) };
+  }).sort((x, y) => y.p - x.p);
+  const flat = expected(eloA, eloB, D);
+  box.innerHTML = `<h3>By map</h3>
+    <div class="table-wrap"><table><thead><tr><th>Map</th><th class="num">${esc(A.name)}</th><th class="num">${esc(B.name)}</th><th class="num">${esc(A.name)} wins a game</th></tr></thead><tbody>
+    ${rows.map((r) => `<tr><td>${esc(r.m.name)}</td>
+      <td class="num">${Math.round(eloA + r.ea)} <span class="muted small">${plainSigned(r.ea)} · ${r.na}g</span></td>
+      <td class="num">${Math.round(eloB + r.eb)} <span class="muted small">${plainSigned(r.eb)} · ${r.nb}g</span></td>
+      <td class="num pct bar-cell"><div class="b" style="width:${(r.p * 100).toFixed(1)}%"></div><span>${pct(r.p, 0)} <span class="muted small">${signed(Math.round((r.p - flat) * 100))}</span></span></td></tr>`).join('')}
+    </tbody></table></div>
+    <p class="muted small" style="margin-bottom:0">Map Elo = the Elo above plus each team's map offset over the ${esc(w.label.toLowerCase())} (games on that map shown as “g”). The last column's small figure is percentage points against the overall ${pct(flat, 0)}. <a href="#/maps">Map Elo for every team →</a></p>`;
+}
+
 // ---- about -----------------------------------------------------------------------
 function viewAbout() {
   const m = S.meta;
@@ -909,17 +1156,20 @@ function viewAbout() {
       <li><b>Leaderboard</b>: every team, rating, record, eligibility tags and ranked-switch setting.</li>
       <li><b>Team pages</b>: read once per team, for its description and the history from before this site started watching. After that, Elo history and records carry forward from the battle log and ranks from the hourly leaderboard.</li>
       <li><b>Battles</b>: every finished battle (ranked and unranked), stored incrementally. ${m.counts.battles.toLocaleString()} so far.</li>
-      <li><b>Match details</b> for a sample of battles: which submission each side used and the map for each game. ${m.counts.details.toLocaleString()} sampled.</li>
+      <li><b>Games</b>: every finished game with its map and winner${m.gamesSince ? ` since ${esc(fmtWhen(m.gamesSince))}` : ''}, stored incrementally. ${(m.counts.games ?? 0).toLocaleString()} so far. These drive <a href="#/maps">Map Elo</a>.</li>
+      <li><b>Match details</b> for a sample of battles: which submission each side used. ${m.counts.details.toLocaleString()} sampled.</li>
       <li><b>Tournaments</b>: the Sprint and Qualifiers brackets as currently seeded.</li>
     </ul>
     <h3>Submissions</h3>
     <p>Other teams' bots can't be downloaded, and the site doesn't list their uploads. It does record, for every match, which submission ID each side played. Each run checks the newest ranked match of teams not checked in the last two hours, top of the ladder first, so a new bot shows up within about two hours. Ranked battles always use each team's active bot. Unranked challenges can use other submissions for either side, so submissions seen only there are listed separately. A submission's record only counts battles seen with it, plus ranked battles between two sightings of it.</p>
+    <h3>Map Elo</h3>
+    <p>A team's map Elo is its current official Elo plus an offset for how much better or worse it does on that map than on its others. The offsets are fitted from every ranked and tournament game in the chosen window, against each opponent's official Elo at the time, and shrunk towards 0 so a few games can't produce a wild number. The <a href="#/maps">Map Elo</a> page explains the model and shows how much it improves predictions.</p>
     <h3>Odds</h3>
     <p>Per-game win probability is the Elo expectation 1 / (1 + 10<sup>(R<sub>B</sub> − R<sub>A</sub>)/D</sup>), with D = 400 as on the site or D fitted to recent ranked games. Series odds treat games as independent (draws ignored). Rating changes use the site's rule: K falls from 96 for a new submission to 24 after 10 ranked battles. Tournament odds simulate the site's tentative brackets, which are re-seeded from the ladder after the final autoscrims, so they will shift. The optional rating uncertainty draws each team's strength from Elo ± σ once per simulated season. The Grand Final format is an assumption, noted on that page.</p>
     <h3>Caveats</h3>
     <ul>
       <li>Battle Elo figures are the ones listed with the battle on the site.</li>
-      <li>Maps and submission stats come from sampled matches, not every game.</li>
+      <li>Submission stats come from sampled matches. Map stats use every game.</li>
       <li>Everything here is public on game.battlecode.au. Team pages link back to the official site for replays.</li>
     </ul>
     <p class="muted small">Last run: ${m.run.requests} requests in ${m.run.seconds}s.</p></div>`;
@@ -937,13 +1187,14 @@ function route() {
   window.scrollTo(0, 0);
   let m;
   if ((m = path.match(/^\/team\/(\d+)/))) viewTeam(Number(m[1]));
+  else if (path === '/maps') viewMaps();
   else if (path === '/matchup') viewMatchup(params);
   else if (path === '/odds') viewOdds(params);
   else if (path === '/battles') viewBattles();
   else if (path === '/stats') viewStats();
   else if (path === '/about') viewAbout();
   else viewLeaderboard();
-  const name = { leaderboard: 'Leaderboard', odds: 'Odds', matchup: 'Matchup', battles: 'Battles', stats: 'Stats', about: 'About' }[nav];
+  const name = { leaderboard: 'Leaderboard', maps: 'Map Elo', odds: 'Odds', matchup: 'Matchup', battles: 'Battles', stats: 'Stats', about: 'About' }[nav];
   const team = m && S.byId.get(Number(m[1]));
   document.title = `${team ? team.name : name || 'Leaderboard'} · Battlecode Stats`;
 }
