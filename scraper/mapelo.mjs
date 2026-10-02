@@ -33,7 +33,7 @@ export const WINDOWS = [
   { key: '7d', label: 'Last 7 days', seconds: 7 * 86400 },
 ];
 export const DEFAULT_WINDOW = '3d';
-const MIN_MAP_SHARE = 0.01;     // maps with fewer of the counted games are tests or retired
+const MIN_MAP_GAMES = 50;       // ranked games a map needs in the window to get a column
 const CHECK_HOURS = 12;         // held out to test the fit
 
 export const counts = (row) => (row[G.kind] & (GK.ranked | GK.tournament)) !== 0;
@@ -240,26 +240,27 @@ export function mapElo({ games, battles, gcur, now }) {
   const longest = WINDOWS[WINDOWS.length - 1];
   const { rated, linked, rankedGames, missing } = gameRatings(games, battles, now - longest.seconds);
   const names = new Map((gcur.maps || []).map((m) => [m.id, m.name]));
-  const perMap = new Map(); // mapId -> { games per window, last }
-  let inLongest = 0;
+  // Until the game log is a week old, the longer windows start where it starts.
+  const earliest = rated.length ? rated[0][0][G.at] : now;
+  const perMap = new Map(); // mapId -> { games per window, first, last }
   for (const [g] of rated) {
     const age = now - g[G.at];
     if (age >= longest.seconds) continue;
-    inLongest++;
-    if (!perMap.has(g[G.map])) perMap.set(g[G.map], { games: WINDOWS.map(() => 0), last: 0 });
+    if (!perMap.has(g[G.map])) perMap.set(g[G.map], { games: WINDOWS.map(() => 0), first: g[G.at], last: 0 });
     const x = perMap.get(g[G.map]);
     WINDOWS.forEach((w, i) => { if (age < w.seconds) x.games[i]++; });
     x.last = Math.max(x.last, g[G.at]);
   }
-  // Maps played in the last day first, then retired ones; alphabetical within each,
-  // so the columns don't shuffle from one update to the next.
-  const maps = [...perMap].filter(([, x]) => x.games[WINDOWS.length - 1] >= MIN_MAP_SHARE * inLongest)
-    .map(([id, x]) => ({ id, name: names.get(id) ?? `Map ${id}`, games: x.games, last: x.last }))
+  // Every map in ranked play gets a column: test maps never show up in ranked
+  // games, and a map added to the pool mid-window still needs one. Maps played
+  // in the last day come first, then retired ones; alphabetical within each,
+  // so the columns don't shuffle from one update to the next. `added` marks a
+  // map that joined the pool after the game log began.
+  const maps = [...perMap].filter(([, x]) => x.games[WINDOWS.length - 1] >= MIN_MAP_GAMES)
+    .map(([id, x]) => ({ id, name: names.get(id) ?? `Map ${id}`, games: x.games, last: x.last,
+      added: x.first > earliest + 86400 ? x.first : null }))
     .sort((a, b) => (b.games[0] > 0) - (a.games[0] > 0) || a.name.localeCompare(b.name));
   const mapIdx = new Map(maps.map((m, i) => [m.id, i]));
-
-  // Until the game log is a week old, the longer windows start where it starts.
-  const earliest = rated.length ? rated[0][0][G.at] : now;
   const teams = {};
   const windows = WINDOWS.map((w, wi) => {
     const res = fit(rated, { from: now - w.seconds, to: Infinity });

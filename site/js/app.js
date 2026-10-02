@@ -912,16 +912,20 @@ function offsetFill(eta) {
 }
 const plainSigned = (n) => (n > 0 ? `+${n}` : n < 0 ? `−${-n}` : '0');
 const cellGames = (c) => (c ? c[2] + c[3] + c[4] : 0);
+/** A map's name, tagged "new" for three days after it joins the ranked pool. */
+const mapLabel = (m) => `${esc(m.name)}${m.added && now() - m.added < 3 * 86400
+  ? ` <span class="tag new" title="In the ranked pool since ${esc(shortDate(m.added))}, so few games yet">new</span>` : ''}`;
 const mapPrefs = (M) => Object.assign({ win: M?.defaultWindow ?? '3d', scope: 'on', q: '', show: 'elo', min: 10, apac: false }, store.get('mapFilters', {}));
 const pickWindow = (M, key) => (M.teams[key] ? key : M.windows[Math.min(1, M.windows.length - 1)].key);
 
 function mapTipHtml(t, elo, map, c, min) {
-  if (!c) return `<div class="tip-h">${esc(t.name)} · ${esc(map.name)}</div>No ranked games on this map in the window.`;
+  const added = map.added ? `<div class="muted">In the ranked pool since ${esc(shortDate(map.added))}.</div>` : '';
+  if (!c) return `<div class="tip-h">${esc(t.name)} · ${esc(map.name)}</div>No ranked games on this map in the window.${added}`;
   const n = cellGames(c);
   return `<div class="tip-h">${esc(t.name)} · ${esc(map.name)}</div>
     <b>${elo + c[0]}</b> map Elo: ${plainSigned(c[0])} vs their usual (± ${c[1]})<br>
     ${c[2]}–${c[3]}–${c[4]} W–D–L in ${n} game${n === 1 ? '' : 's'} · ${pct(winPct(c[2], c[4]), 0)} won
-    ${n < min ? `<div class="muted">Fewer than ${min} games, so this leans on the prior.</div>` : ''}`;
+    ${n < min ? `<div class="muted">Fewer than ${min} games, so this leans on the prior.</div>` : ''}${added}`;
 }
 
 /** One floating tooltip for map cells/bars; `html(el)` builds the content for a hovered element. */
@@ -979,12 +983,17 @@ async function viewMaps() {
       <span class="ramp-legend"><span>−${OFFSET_CAP} worse</span><span class="ramp" aria-hidden="true"></span><span>+${OFFSET_CAP} better than usual</span></span>
       <span class="muted small" id="mcount"></span>
     </div>
+    ${(() => {
+      const fresh = maps.filter((m) => m.added && now() - m.added < 3 * 86400);
+      return fresh.length ? `<p class="note">${fresh.length} map${fresh.length === 1 ? '' : 's'} joined the ranked pool on ${esc(shortDate(Math.min(...fresh.map((m) => m.added))))}
+        (${fresh.map((m) => esc(m.name)).join(', ')}). Until they have more games, most of their cells are faded and stay close to each team's usual Elo.</p>` : '';
+    })()}
     <div class="table-wrap"><table id="mt" class="heat">
       <thead><tr>
         <th data-sort="rank" data-dir="asc" class="num hide-sm">#</th>
         <th data-sort="name" data-dir="asc" class="sticky">Team</th>
         <th data-sort="elo" class="num" title="Official Elo">Elo</th>
-        ${maps.map((m, i) => `<th data-sort="m${i}" class="map">${esc(m.name)}<span class="muted" id="mg${i}"></span></th>`).join('')}
+        ${maps.map((m, i) => `<th data-sort="m${i}" class="map">${mapLabel(m)}<span class="muted" id="mg${i}"></span></th>`).join('')}
         <th data-sort="spread" class="num hide-sm" title="Best map minus worst map, counting maps with enough games">Spread</th>
       </tr></thead><tbody></tbody></table></div>
     <h2>Best on each map</h2>
@@ -1076,7 +1085,7 @@ async function viewMaps() {
     // Leaders: top five on each map among the teams shown, with enough games there.
     $('#leaders').innerHTML = maps.map((m, i) => {
       const top = rows.filter((r) => ok(r.cells[i])).sort((a, b) => (b.t.elo + b.cells[i][0]) - (a.t.elo + a.cells[i][0])).slice(0, 5);
-      return `<div class="card"><h3 style="margin:0">${esc(m.name)}</h3><div class="muted small">${m.games[wi].toLocaleString()} games</div>
+      return `<div class="card"><h3 style="margin:0">${mapLabel(m)}</h3><div class="muted small">${m.games[wi].toLocaleString()} games</div>
         ${top.length ? `<ol>${top.map((r, k) => `<li><span class="rk">${k + 1}</span>${teamLink(r.t.id, r.t.name)}<span class="num">${r.t.elo + r.cells[i][0]} <span class="muted small">${plainSigned(r.cells[i][0])}</span></span></li>`).join('')}</ol>` : '<p class="muted small">No team with enough games.</p>'}</div>`;
     }).join('');
   }
@@ -1101,10 +1110,10 @@ async function teamMaps(t) {
       ${data ? `<div class="mbars">
         <div class="mbar head"><span>Map</span><span style="text-align:center;white-space:nowrap">← worse · better →</span><span style="text-align:right">Map Elo</span><span style="text-align:right">W–L</span></div>
         ${rows.map(({ m, i, c }) => {
-          if (!c) return `<div class="mbar"><div class="lab">${esc(m.name)}</div><div class="track"></div><div class="val muted">—</div><div class="rec">0–0</div></div>`;
+          if (!c) return `<div class="mbar"><div class="lab">${mapLabel(m)}</div><div class="track"></div><div class="val muted">—</div><div class="rec">0–0</div></div>`;
           const thin = cellGames(c) < f.min;
           const w = (Math.min(Math.abs(c[0]) / OFFSET_CAP, 1) * 50).toFixed(1);
-          return `<div class="mbar" data-i="${i}"><div class="lab">${esc(m.name)}</div>
+          return `<div class="mbar" data-i="${i}"><div class="lab">${mapLabel(m)}</div>
             <div class="track"><div class="fill ${c[0] >= 0 ? 'pos' : 'neg'}${thin ? ' thin' : ''}" style="width:${w}%"></div></div>
             <div class="val"><b>${t.elo + c[0]}</b> <span class="muted small">${plainSigned(c[0])}</span></div>
             <div class="rec">${c[2]}–${c[4]}</div></div>`;
@@ -1137,7 +1146,7 @@ async function matchupMaps(A, B, eloA, eloB, D) {
   const flat = expected(eloA, eloB, D);
   box.innerHTML = `<h3>By map</h3>
     <div class="table-wrap"><table><thead><tr><th>Map</th><th class="num">${esc(A.name)}</th><th class="num">${esc(B.name)}</th><th class="num">${esc(A.name)} wins a game</th></tr></thead><tbody>
-    ${rows.map((r) => `<tr><td>${esc(r.m.name)}</td>
+    ${rows.map((r) => `<tr><td>${mapLabel(r.m)}</td>
       <td class="num">${Math.round(eloA + r.ea)} <span class="muted small">${plainSigned(r.ea)} · ${r.na}g</span></td>
       <td class="num">${Math.round(eloB + r.eb)} <span class="muted small">${plainSigned(r.eb)} · ${r.nb}g</span></td>
       <td class="num pct bar-cell"><div class="b" style="width:${(r.p * 100).toFixed(1)}%"></div><span>${pct(r.p, 0)} <span class="muted small">${signed(Math.round((r.p - flat) * 100))}</span></span></td></tr>`).join('')}
