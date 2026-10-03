@@ -1,4 +1,4 @@
-import { TIERS, tierOf, expected, kForCount, eloDelta, fixedSeries, firstTo, seededSlots } from './model.js';
+import { TIERS, tierOf, expected, fixedSeries, firstTo, seededSlots, effectiveDivisor, seriesWithFirstMover, NEW_SYSTEM } from './model.js';
 import { esc, lineChart, sparkline, columnChart, hbars, fmtWhen } from './charts.js';
 
 // ---------------------------------------------------------------------------
@@ -74,6 +74,20 @@ function switchCell(t) {
   const next = (t.acceptingChangedAt || 0) + 8 * 3600;
   const lock = next > now() ? ` <span class="muted small" title="The switch has an eight-hour cooldown">· locked ${Math.ceil((next - now()) / 3600)}h</span>` : '';
   return `${t.accepting ? '<span class="tag on">On</span>' : '<span class="tag off">Off</span>'}${lock}`;
+}
+
+/** A team's Sprint finish, from the published bracket. */
+function sprintResultHtml(id) {
+  const t = S.tour?.tournaments?.find((x) => x.id === 'sprint');
+  if (!t?.rounds?.length) return '<p class="muted">No Sprint bracket.</p>';
+  const seed = t.rounds[0].flatMap((m) => [m.a, m.b]).find((x) => x?.teamId === id)?.seed;
+  if (seed == null) return '<p class="muted">Not in the Sprint field.</p>';
+  if (!tournamentDone(t)) return `<p class="muted">Seed ${seed}. Not played yet.</p>`;
+  const r = bracketResults(t).out.get(id);
+  if (!r) return `<p>Seed ${seed} · <span class="muted">had a bye or no recorded result</span></p>`;
+  return r.champion
+    ? `<p style="font-size:18px;margin:.2rem 0">🏆 Won the Sprint</p><p class="muted small">Seed ${seed} · beat ${esc(r.beat?.name ?? '?')} ${esc(r.score)} in the final</p>`
+    : `<p style="font-size:18px;margin:.2rem 0">${esc(r.label)}</p><p class="muted small">Seed ${seed} · lost ${esc(r.score)} to ${esc(r.lostTo?.name ?? '?')}</p>`;
 }
 
 function setUpdated() {
@@ -181,16 +195,16 @@ function bracketCfg(t, elo, reseed) {
   return { slots, bestOf: t.bestOf || 7, forced, seedOf };
 }
 
-function simulateOdds({ sims = 5000, D = 400, sigma = 0, overrides = {}, reseed = false } = {}) {
-  const key = JSON.stringify({ sims, D, sigma, overrides, reseed, u: S.meta?.updatedAt });
+function simulateOdds({ sims = 5000, D = 400, sigma = 0, overrides = {}, reseed = false, firstMover = 0 } = {}) {
+  const key = JSON.stringify({ sims, D, sigma, overrides, reseed, firstMover, u: S.meta?.updatedAt });
   if (S.oddsCache.has(key)) return S.oddsCache.get(key);
   const elo = {};
   for (const t of S.teams) elo[t.id] = overrides[t.id] ?? t.elo;
   const sprintT = S.tour?.tournaments?.find((t) => t.kind === 'sprint' || t.id === 'sprint');
   const qualT = S.tour?.tournaments?.find((t) => t.kind === 'qualifier' || t.id === 'qualifier');
   const cfg = {
-    sims, D, sigma, seed: 20261017, elo,
-    sprint: sprintT ? bracketCfg(sprintT, elo, reseed) : null,
+    sims, D, sigma, firstMover, seed: 20261017, elo,
+    sprint: sprintT && !tournamentDone(sprintT) ? bracketCfg(sprintT, elo, reseed) : null,
     qualifier: qualT ? bracketCfg(qualT, elo, reseed) : null,
     grandFinal: { bestOf: S.tour?.grandFinal?.bestOf || 5, size: S.tour?.grandFinal?.teams || 10 },
   };
@@ -202,8 +216,26 @@ function simulateOdds({ sims = 5000, D = 400, sigma = 0, overrides = {}, reseed 
   S.oddsCache.set(key, p);
   return p;
 }
+/** Default model: the site's rating system on unseen maps (see viewOdds). */
+const NEW_MODEL = { botSigma: 60 };
 function defaultOdds() {
-  return simulateOdds({ sims: 5000, D: 400 }).then((r) => (S.defaultOdds = r));
+  return simulateOdds({ sims: 5000, D: Math.round(effectiveDivisor(NEW_MODEL.botSigma)), firstMover: NEW_SYSTEM.firstMover }).then((r) => (S.defaultOdds = r));
+}
+const tournamentDone = (t) => t?.status === 'done' || t?.status === 'completed' || !!t?.rounds?.[t.rounds.length - 1]?.[0]?.winner;
+
+/** Who went out where in a finished (or part-played) bracket. */
+function bracketResults(t) {
+  const R = t.rounds.length, out = new Map(), upsets = [];
+  const roundName = (r) => { const left = 2 ** (R - r); return left === 2 ? 'Final' : left === 4 ? 'Semifinal' : left === 8 ? 'Quarterfinal' : `Round of ${left}`; };
+  t.rounds.forEach((round, r) => round.forEach((m) => {
+    if (!m.a || !m.b || !m.winner) return;
+    const w = m.winner === 'a' ? m.a : m.b, l = m.winner === 'a' ? m.b : m.a;
+    out.set(l.teamId, { round: r, label: roundName(r), self: l, lostTo: w, score: `${l.score ?? '?'}–${w.score ?? '?'}` });
+    if (r === R - 1) out.set(w.teamId, { round: R, label: 'Champion', champion: true, self: w, beat: l, score: `${w.score ?? '?'}–${l.score ?? '?'}` });
+    if (w.seed != null && l.seed != null && w.seed > l.seed) upsets.push({ w, l, r, label: roundName(r), gap: w.seed - l.seed });
+  }));
+  upsets.sort((a, b) => b.gap - a.gap);
+  return { out, upsets, R, roundName };
 }
 const oddsFor = (res, id) => {
   if (!res) return null;
@@ -212,7 +244,7 @@ const oddsFor = (res, id) => {
     sprintWin: s ? s[R] / n : 0, sprintFinal: s ? s[R - 1] / n : 0, sprintSF: s ? s[R - 2] / n : 0, sprintQF: s ? s[R - 3] / n : 0,
     inSprint: !!s, inQual: !!res.cfg.qualifier?.seedOf?.[id],
     qualify: q ? q[2] / n : 0, qualifyDirect: q ? q[0] / n : 0, qualifyLoser: q ? q[1] / n : 0,
-    gfFinal: q ? q[3] / n : 0, gfWin: q ? q[4] / n : 0, qualWin: q ? q[5] / n : 0,
+    gfFinal: q ? q[3] / n : 0, gfWin: q ? q[4] / n : 0, qualWin: q ? q[5] / n : 0, reachR16: q ? (q[6] ?? 0) / n : 0,
   };
 };
 
@@ -380,13 +412,13 @@ async function viewTeam(id) {
       <div class="tile"><div class="k">Battles, last 24h</div><div class="v">${t.series24}</div><div class="s">${t.ranked24} ranked · last ${ago(t.lastBattle)}</div></div>
     </div>
     ${od ? `<div class="grid2">
-      <div class="card"><h3>Sprint · 1 Oct</h3>${od.inSprint ? hbars([
-        { label: 'Quarterfinal', value: od.sprintQF, cls: 's1' }, { label: 'Semifinal', value: od.sprintSF, cls: 's1' },
-        { label: 'Final', value: od.sprintFinal, cls: 's1' }, { label: 'Win', value: od.sprintWin, cls: 's1' }], { max: 1 }) : '<p class="muted">Not in the Sprint field.</p>'}</div>
-      <div class="card"><h3>Championship · Qualifiers → Grand Final</h3>${od.inQual ? hbars([
-        { label: 'Qualify', value: od.qualify, cls: 's3' }, { label: 'Reach GF final', value: od.gfFinal, cls: 's3' },
-        { label: 'Win Grand Final', value: od.gfWin, cls: 's3' }], { max: 1 }) : `<p class="muted">${t.eligible ? 'Not in the current Qualifiers field.' : 'Not eligible for the Qualifiers (APAC teams only).'}</p>`}</div>
-    </div><p class="muted small">Pure-Elo simulation of the site's tentative brackets using current ratings. <a href="#/odds">Adjust the model →</a></p>` : ''}
+      <div class="card"><h3>Qualifiers → Grand Final</h3>${od.inQual ? hbars([
+        { label: 'Round of 16', value: od.reachR16, cls: 's3' }, { label: 'Qualify', value: od.qualify, cls: 's3' },
+        { label: 'Win Qualifiers', value: od.qualWin, cls: 's3' }, { label: 'Reach GF final', value: od.gfFinal, cls: 's3' },
+        { label: 'Win Grand Final', value: od.gfWin, cls: 's3' }], { max: 1 }) : `<p class="muted">${t.eligible ? 'Not in the current Qualifiers field.' : 'Not eligible for the Qualifiers (APAC teams only).'}</p>`}
+        ${od.inQual ? `<p class="muted small" style="margin-bottom:0">Tentative seed ${S.defaultOdds?.cfg?.qualifier?.seedOf?.[t.id] ?? '—'} · qualifies ${pct(od.qualifyDirect)} via the quarterfinals, ${pct(od.qualifyLoser)} via the second-chance bracket.</p>` : ''}</div>
+      <div class="card"><h3>Sprint · 1 Oct</h3>${sprintResultHtml(t.id)}</div>
+    </div><p class="muted small">Simulated with the site's new rating formula on unseen maps (current ratings, tentative bracket). <a href="#/odds">Adjust the model →</a></p>` : ''}
     ${me && me.id !== t.id ? matchupCard(me, t) : ''}
     <h2>Elo over time</h2>
     <div class="card">
@@ -493,12 +525,14 @@ async function viewTeam(id) {
 }
 
 function matchupCard(a, b) {
-  const p = expected(a.elo, b.elo);
+  const fm = NEW_SYSTEM.firstMover, gap = a.elo - b.elo;
+  const p = seriesWithFirstMover((x) => x, gap, effectiveDivisor(NEW_MODEL.botSigma, false), fm);
+  const bo7 = seriesWithFirstMover((x) => firstTo(x, 4), gap, effectiveDivisor(NEW_MODEL.botSigma, true), fm);
   return `<div class="card" style="margin-top:14px"><h3>${esc(a.name)} (you) vs ${esc(b.name)}</h3>
     <div class="hero">
       <div><div class="muted small">You win a game</div><div class="big-elo" style="font-size:26px">${pct(p, 0)}</div></div>
       <div><div class="muted small">Ranked battle (5 games)</div><div style="font-size:20px;font-weight:650">${(p * 5).toFixed(1)} – ${((1 - p) * 5).toFixed(1)}</div></div>
-      <div><div class="muted small">Best of 7 knockout</div><div style="font-size:20px;font-weight:650">${pct(firstTo(p, 4), 0)}</div></div>
+      <div><div class="muted small">Best of 7 (Qualifiers, unseen maps)</div><div style="font-size:20px;font-weight:650">${pct(bo7, 0)}</div></div>
       <div><div class="muted small">Ranked challenge allowed?</div><div style="font-size:15px;margin-top:4px">${canChallenge(a, b) ? '<span class="ok">Yes</span>' : '<span class="no">No</span>'}</div></div>
     </div>
     <a href="#/matchup?a=${a.id}&b=${b.id}">Full matchup breakdown →</a></div>`;
@@ -509,64 +543,62 @@ function viewMatchup(params) {
   const me = myTeam();
   let A = S.byId.get(Number(params.get('a'))) || me || S.teams.find((t) => t.rank === 1);
   let B = S.byId.get(Number(params.get('b'))) || S.teams.find((t) => t.rank === (A?.rank === 1 ? 2 : 1));
-  const st = { eloA: A?.elo ?? 1500, eloB: B?.elo ?? 1500, kA: 24, kB: 24, D: 400 };
-  const kOpts = (sel) => [[24, 'Settled bot (K 24)'], [60, '5 ranked battles in (K 60)'], [96, 'Brand-new bot (K 96)']]
-    .map(([k, l]) => `<option value="${k}" ${k === sel ? 'selected' : ''}>${l}</option>`).join('');
+  const st = { eloA: A?.elo ?? 1500, eloB: B?.elo ?? 1500, model: 'new', D: 400 };
 
   main.innerHTML = `
     <h1>Matchup</h1>
-    <p class="lede">What Elo implies for any two teams (or any two ratings): single-game odds, the spread of ranked-battle results, how much rating each result moves, and knockout-series odds for the tournaments.</p>
+    <p class="lede">What the ratings imply for any two teams (or any two ratings): single-game odds, the spread of ranked-battle results, and knockout-series odds for the tournaments.</p>
     <div class="card">
       <div class="vs">
         <div class="side"><label class="muted small" for="ma">Team A</label><input id="ma" list="teamlist" value="${esc(teamValue(A))}" autocomplete="off">
-          <div class="row"><label>Elo <input id="ea" type="number" step="1" value="${st.eloA}"></label><select id="ka" aria-label="Team A K factor">${kOpts(24)}</select></div></div>
+          <div class="row"><label>Rating <input id="ea" type="number" step="1" value="${st.eloA}"></label></div></div>
         <div class="mid">vs</div>
         <div class="side"><label class="muted small" for="mb">Team B</label><input id="mb" list="teamlist" value="${esc(teamValue(B))}" autocomplete="off">
-          <div class="row"><label>Elo <input id="eb" type="number" step="1" value="${st.eloB}"></label><select id="kb" aria-label="Team B K factor">${kOpts(24)}</select></div></div>
+          <div class="row"><label>Rating <input id="eb" type="number" step="1" value="${st.eloB}"></label></div></div>
       </div>
       <div class="controls" style="margin-bottom:0">
         <span class="muted small">Model</span>
-        <div class="seg" id="md"><button data-d="400">Pure Elo (400)</button><button data-d="fit">Fitted to results (${fittedD()})</button></div>
+        <div class="seg" id="md"><button data-d="new" title="The site's rating formula: uncertainty widens gaps, +20 to whoever moves first">New system</button><button data-d="400">Ladder Elo (400)</button><button data-d="fit">Fitted to results (${fittedD()})</button></div>
         <button class="btn" id="swap" type="button">Swap sides</button>
       </div>
     </div>
     <div id="mres"></div>`;
 
   const upd = () => {
-    const p = expected(st.eloA, st.eloB, st.D);
-    const eSite = expected(st.eloA, st.eloB, 400); // rating changes always use the site's 400
-    const dist = fixedSeries(p, 5);
+    // New system: ranked games are on pool maps the bots have played (bot σ only); tournament
+    // games are on unseen maps (offsets 0 ± 150 too). Who moves first is unknown, so average.
+    const fm = st.model === 'new' ? NEW_SYSTEM.firstMover : 0;
+    const Dr = st.model === 'new' ? effectiveDivisor(NEW_MODEL.botSigma, false) : st.D;
+    const Dt = st.model === 'new' ? effectiveDivisor(NEW_MODEL.botSigma, true) : st.D;
+    const gap = st.eloA - st.eloB;
+    const p = seriesWithFirstMover((x) => x, gap, Dr, fm);
+    const dist = [0, 1, 2, 3, 4, 5].map((k) => seriesWithFirstMover((x) => fixedSeries(x, 5)[k], gap, Dr, fm));
+    const bo7 = seriesWithFirstMover((x) => firstTo(x, 4), gap, Dt, fm), bo5 = seriesWithFirstMover((x) => firstTo(x, 3), gap, Dt, fm);
     const nameA = A ? A.name : 'Team A', nameB = B ? B.name : 'Team B';
     const pRanked = dist[3] + dist[4] + dist[5];
-    const expDelta = dist.reduce((s, q, k) => s + q * eloDelta(k / 5, eSite, st.kA), 0);
     const maxP = Math.max(...dist);
     const allowAB = A && B ? canChallenge(A, B) : null, allowBA = A && B ? canChallenge(B, A) : null;
     $('#mres').innerHTML = `
       <div class="hero">
-        <div class="tile"><div class="k">${esc(nameA)} wins a game</div><div class="v">${pct(p, 1)}</div><div class="s">Elo gap ${signed(Math.round(st.eloA - st.eloB))}</div></div>
+        <div class="tile"><div class="k">${esc(nameA)} wins a game</div><div class="v">${pct(p, 1)}</div><div class="s">rating gap ${signed(Math.round(st.eloA - st.eloB))}${st.model === 'new' ? ' · ranked map' : ''}</div></div>
         <div class="tile"><div class="k">Expected ranked score</div><div class="v">${(p * 5).toFixed(2)} – ${((1 - p) * 5).toFixed(2)}</div><div class="s">of 5 games</div></div>
         <div class="tile"><div class="k">${esc(nameA)} takes the battle (3+ of 5)</div><div class="v">${pct(pRanked, 1)}</div><div class="s">Ranked, all five games played</div></div>
-        <div class="tile"><div class="k">Best of 7 (Sprint, Qualifiers)</div><div class="v">${pct(firstTo(p, 4), 1)}</div><div class="s">first to 4 · ${esc(nameA)}</div></div>
-        <div class="tile"><div class="k">Best of 5 (Grand Final)</div><div class="v">${pct(firstTo(p, 3), 1)}</div><div class="s">first to 3 · ${esc(nameA)}</div></div>
+        <div class="tile"><div class="k">Best of 7 (Qualifiers)</div><div class="v">${pct(bo7, 1)}</div><div class="s">first to 4 · ${esc(nameA)}${st.model === 'new' ? ' · unseen maps' : ''}</div></div>
+        <div class="tile"><div class="k">Best of 5 (Grand Final)</div><div class="v">${pct(bo5, 1)}</div><div class="s">first to 3 · ${esc(nameA)}${st.model === 'new' ? ' · unseen maps' : ''}</div></div>
       </div>
       <div class="card">
         <h3>Ranked battle outcomes</h3>
         <div class="legend"><span><i class="key s1"></i>Probability of each score for ${esc(nameA)}</span></div>
-        <div class="dist">${[5, 4, 3, 2, 1, 0].map((k) => {
-          const dA = eloDelta(k / 5, eSite, st.kA), dB = eloDelta((5 - k) / 5, 1 - eSite, st.kB);
-          return `<div class="col s1"><div class="barwrap"><div style="height:${Math.max(2, (dist[k] / maxP) * 100)}%"></div></div>
-            <div class="lab">${k}–${5 - k}</div><div class="p">${pct(dist[k], 1)}</div>
-            <div class="d">A ${signed(dA)}</div><div class="d">B ${signed(dB)}</div></div>`;
-        }).join('')}</div>
-        <p class="muted small" style="margin-top:12px">Rating change = K × (games won ÷ 5 − expected share), rounded, where expected share is ${pct(eSite, 1)} for ${esc(nameA)} at these ratings.
-        Expected change for ${esc(nameA)} this battle: ${expDelta >= 0 ? '+' : '−'}${Math.abs(expDelta).toFixed(2)}${st.D !== 400 ? ' (under the fitted model, a nonzero expectation means the ladder is mis-pricing this gap)' : ''}.</p>
+        <div class="dist">${[5, 4, 3, 2, 1, 0].map((k) => `<div class="col s1"><div class="barwrap"><div style="height:${Math.max(2, (dist[k] / maxP) * 100)}%"></div></div>
+            <div class="lab">${k}–${5 - k}</div><div class="p">${pct(dist[k], 1)}</div></div>`).join('')}</div>
+        <p class="muted small" style="margin-top:12px">${st.model === 'new' ? `New system: the site's formula with each bot's rating ±${NEW_MODEL.botSigma} (an effective divisor of ${Math.round(Dr)} on maps they have played, ${Math.round(Dt)} on unseen tournament maps) and +${NEW_SYSTEM.firstMover} to whoever moves first, averaged both ways. ` : ''}Since the 1 Oct reset, a battle moves each team's rating by an amount that depends on how settled both bots are (new bots move fast, settled ones barely), so rating changes aren't predicted here. See the <a href="${SITE}/docs/elo" rel="noopener">site's docs</a>.</p>
       </div>
       ${A && B ? `<div class="card"><h3>Can they request a ranked battle?</h3>
         <p>${esc(A.name)} → ${esc(B.name)}: ${allowAB ? '<span class="ok">Allowed</span>' : '<span class="no">Not allowed</span>'} · ${esc(B.name)} → ${esc(A.name)}: ${allowBA ? '<span class="ok">Allowed</span>' : '<span class="no">Not allowed</span>'}</p>
         <p class="muted small">Both teams need an active bot and the ranked switch on, and the target may be at most 50 below the challenger. Switches: ${esc(A.name)} ${switchCell(A)} · ${esc(B.name)} ${switchCell(B)}</p></div>
         <div class="card" id="mmaps"><h3>By map</h3><p class="muted">Loading…</p></div>
         <div class="card" id="mh2h"><h3>History</h3><p class="muted">Loading…</p></div>` : ''}`;
-    if (A && B) matchupMaps(A, B, st.eloA, st.eloB, st.D);
+    if (A && B) matchupMaps(A, B, st.eloA, st.eloB, st.model === 'new' ? effectiveDivisor(NEW_MODEL.botSigma, false) : st.D);
     if (A && B) teamDetail(A.id).then((d) => {
       const box = $('#mh2h');
       if (!box) return;
@@ -590,61 +622,74 @@ function viewMatchup(params) {
   $('#mb').onchange = (e) => setSide('b', parseTeam(e.target.value));
   $('#ea').oninput = (e) => { st.eloA = Number(e.target.value) || 0; upd(); };
   $('#eb').oninput = (e) => { st.eloB = Number(e.target.value) || 0; upd(); };
-  $('#ka').onchange = (e) => { st.kA = Number(e.target.value); upd(); };
-  $('#kb').onchange = (e) => { st.kB = Number(e.target.value); upd(); };
   const segBtns = $$('#md button');
-  const setD = (v) => { st.D = v === 'fit' ? fittedD() : 400; segBtns.forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.d === v))); upd(); };
+  const setD = (v) => { st.model = v; st.D = v === 'fit' ? fittedD() : 400; segBtns.forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.d === v))); upd(); };
   segBtns.forEach((b) => { b.onclick = () => setD(b.dataset.d); });
   $('#swap').onclick = () => {
-    [A, B] = [B, A]; [st.eloA, st.eloB] = [st.eloB, st.eloA]; [st.kA, st.kB] = [st.kB, st.kA];
+    [A, B] = [B, A]; [st.eloA, st.eloB] = [st.eloB, st.eloA];
     $('#ma').value = teamValue(A); $('#mb').value = teamValue(B); $('#ea').value = st.eloA; $('#eb').value = st.eloB;
-    $('#ka').value = st.kA; $('#kb').value = st.kB;
     history.replaceState(null, '', `#/matchup?a=${A?.id ?? ''}&b=${B?.id ?? ''}`);
     upd();
   };
-  setD('400');
+  setD('new');
 }
 
 // ---- odds -------------------------------------------------------------------
 function viewOdds(params) {
-  const o = Object.assign({ tab: 'champ', sims: 10000, model: '400', sigma: 0, reseed: false, overrides: {} }, store.get('odds', {}));
+  const o = Object.assign({ tab: 'champ', sims: 10000, model: 'new', botSigma: NEW_MODEL.botSigma, sigma: 0, reseed: false, overrides: {} }, store.get('odds', {}));
+  if (!['new', '400', 'fit'].includes(o.model)) o.model = 'new';
   if (params.get('tab')) o.tab = params.get('tab');
   const gf = S.tour?.grandFinal;
   const sprintT = S.tour?.tournaments?.find((t) => t.id === 'sprint');
   const qualT = S.tour?.tournaments?.find((t) => t.id === 'qualifier');
+  const day = (iso) => (iso ? new Date(iso).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }) : '');
+  const sprintDone = tournamentDone(sprintT);
   main.innerHTML = `
     <h1>Tournament odds</h1>
-    <p class="lede">Monte Carlo over the site's tentative brackets (seeded from the current ladder), where each game is won with the Elo-implied probability.
-    The championship path is the <b>Qualifiers</b> (${qualT ? `${qualT.size} APAC teams, best of ${qualT.bestOf}` : 'APAC teams'}; 8 quarterfinalists plus 2 from the Round-of-16 losers' bracket advance)
-    into the <b>Grand Final</b> (${gf ? `${gf.teams} teams, best of ${gf.bestOf}, ${new Date(gf.date).toLocaleDateString(undefined, { day: 'numeric', month: 'short' })}` : '10 teams'}).</p>
+    <p class="lede">Monte Carlo over the site's own brackets, seeded from the current ladder. The championship path is the <b>Qualifiers</b>
+    (${qualT ? `${qualT.size} APAC teams, best of ${qualT.bestOf}, ${day(qualT.date)}` : 'APAC teams'}; the eight quarterfinalists plus two from the Round-of-16 losers' bracket go through)
+    into the <b>Grand Final</b> (${gf ? `${gf.teams} teams, best of ${gf.bestOf}, ${day(gf.date)}` : '10 teams'}).</p>
     <div class="card">
       <div class="controls" style="margin-top:0">
         <label>Simulations <select id="o-sims">${[2000, 10000, 50000].map((n) => `<option value="${n}" ${n === o.sims ? 'selected' : ''}>${n.toLocaleString()}</option>`).join('')}</select></label>
         <span class="muted small">Win probability</span>
-        <div class="seg" id="o-model"><button data-m="400">Pure Elo</button><button data-m="fit" title="Divisor fitted to recent ranked results">Fitted (${fittedD()})</button></div>
-        <label title="Each simulated season draws every team's true strength from Elo ± this much, to account for ratings being noisy and bots changing before the event">Rating uncertainty ±<input id="o-sigma" type="range" min="0" max="200" step="10" value="${o.sigma}"><span id="o-sigma-v" class="num">${o.sigma}</span></label>
+        <div class="seg" id="o-model">
+          <button data-m="new" title="The site's own rating formula on unseen maps: uncertainty widens every gap, and whoever moves first gets +20">New system</button>
+          <button data-m="400" title="Plain Elo on ladder ratings, divisor 400">Ladder Elo</button>
+          <button data-m="fit" title="Divisor fitted to recent ranked results">Fitted (${fittedD()})</button>
+        </div>
+        <label id="o-bot-wrap" title="How unsure each bot's overall rating is (the site doesn't publish it). New bots start at ±200; settled ones shrink towards ±30">Bot rating ±<select id="o-bot">${[30, 60, 100, 200].map((n) => `<option value="${n}" ${n === o.botSigma ? 'selected' : ''}>${n}</option>`).join('')}</select></label>
+        <label title="Each simulated season draws every team's true strength from its rating ± this much, for bots improving or slipping before the event">Strength drift ±<input id="o-sigma" type="range" min="0" max="200" step="10" value="${o.sigma}"><span id="o-sigma-v" class="num">${o.sigma}</span></label>
         <label class="chip" title="Re-seed the brackets from ratings including your what-ifs, instead of the site's current bracket"><input type="checkbox" id="o-reseed" ${o.reseed ? 'checked' : ''}>Re-seed brackets</label>
       </div>
-      <details ${Object.keys(o.overrides).length ? 'open' : ''}><summary>What if… (override a team's Elo)</summary>
-        <div class="controls"><input id="wi-team" list="teamlist" placeholder="Team…" autocomplete="off"><input id="wi-elo" type="number" placeholder="Elo" style="width:90px"><button class="btn" id="wi-add" type="button">Apply</button></div>
+      <details ${Object.keys(o.overrides).length ? 'open' : ''}><summary>What if… (override a team's rating)</summary>
+        <div class="controls"><input id="wi-team" list="teamlist" placeholder="Team…" autocomplete="off"><input id="wi-elo" type="number" placeholder="Rating" style="width:90px"><button class="btn" id="wi-add" type="button">Apply</button></div>
         <div class="whatifs" id="wi-list"></div>
       </details>
     </div>
     <div class="tabs" role="tablist">
-      <button role="tab" data-tab="champ">Championship</button>
-      <button role="tab" data-tab="sprint">Sprint · ${sprintT ? new Date(sprintT.date).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }) : ''}</button>
+      <button role="tab" data-tab="champ">Qualifiers &amp; Grand Final</button>
+      <button role="tab" data-tab="sprint">Sprint · ${sprintDone ? 'results' : day(sprintT?.date)}</button>
     </div>
     <div id="o-status" class="muted small"></div>
-    <div id="o-out"></div>`;
+    <div id="o-out"></div>
+    <details class="card" style="margin-top:14px"><summary><b>How these odds use the new rating system</b></summary>
+      <p class="small ink2">On 1 October the site reset every rating and switched systems (<a href="${SITE}/docs/elo" rel="noopener">docs</a>). Each <b>submission</b> now has its own rating plus an offset on every map, and each of those numbers carries a σ for how sure the site is. A game on a map is predicted as 1 / (1 + e<sup>−z/s</sup>), where z is the gap (ln 10 / 400 per point, plus 20 points to whoever moves first) and s = √(1 + πv/8) grows with the σs, pulling predictions towards 50%. A team's ladder rating is its active bot's rating averaged over the ranked map pool.</p>
+      <p class="small ink2"><b>New system</b> applies that formula to tournament games. Every Sprint and Qualifier map is unseen, so each bot's offset there is still 0 ± ${NEW_SYSTEM.unseenMapSigma}; with ±${o.botSigma} on each bot's overall rating that is the same as an Elo divisor of <b>${Math.round(effectiveDivisor(o.botSigma))}</b> instead of 400, so favourites are less safe than the ladder gap suggests. Who moves first in a tournament game isn't published, so both ways are averaged. Two things the public pages don't show: each bot's σ (set it above) and how much of its ladder rating comes from map offsets that won't carry over to unseen maps, so the ladder rating stands in for the overall rating. <b>Ladder Elo</b> is plain divisor-400 Elo for comparison; <b>Fitted</b> uses the divisor that best predicts recent ranked games.</p>
+      <p class="small ink2">Tiers changed with the reset: Fishing Boat 3000+, Leviathan 2700, Orca 2300, Shark 1900, Swordfish 1500, Tunafish 1100, Shrimp 700, Plankton below. Rating changes now depend on how settled both bots are, so the old fixed-K rules no longer apply.</p>
+    </details>`;
 
   const save = () => store.set('odds', o);
   let timer;
   const rerun = () => { clearTimeout(timer); timer = setTimeout(run, 120); };
+  const showBot = () => { $('#o-bot-wrap').style.display = o.model === 'new' ? '' : 'none'; };
+  showBot();
   $('#o-sims').onchange = (e) => { o.sims = Number(e.target.value); save(); rerun(); };
   $$('#o-model button').forEach((b) => {
     b.setAttribute('aria-pressed', String(b.dataset.m === o.model));
-    b.onclick = () => { o.model = b.dataset.m; save(); $$('#o-model button').forEach((x) => x.setAttribute('aria-pressed', String(x === b))); rerun(); };
+    b.onclick = () => { o.model = b.dataset.m; save(); $$('#o-model button').forEach((x) => x.setAttribute('aria-pressed', String(x === b))); showBot(); rerun(); };
   });
+  $('#o-bot').onchange = (e) => { o.botSigma = Number(e.target.value); save(); rerun(); };
   $('#o-sigma').oninput = (e) => { o.sigma = Number(e.target.value); $('#o-sigma-v').textContent = o.sigma; save(); rerun(); };
   $('#o-reseed').onchange = (e) => { o.reseed = e.target.checked; save(); rerun(); };
   const drawWI = () => {
@@ -660,30 +705,58 @@ function viewOdds(params) {
   $('#wi-team').onchange = () => { const t = parseTeam($('#wi-team').value); if (t && !$('#wi-elo').value) $('#wi-elo').value = t.elo + 100; };
   $$('.tabs button').forEach((b) => {
     b.setAttribute('aria-selected', String(b.dataset.tab === o.tab));
-    b.onclick = () => { o.tab = b.dataset.tab; save(); $$('.tabs button').forEach((x) => x.setAttribute('aria-selected', String(x === b))); if (last) draw(last); };
+    b.onclick = () => { o.tab = b.dataset.tab; save(); $$('.tabs button').forEach((x) => x.setAttribute('aria-selected', String(x === b))); if (o.tab === 'sprint' && sprintDone) drawSprintResults(); else if (last) draw(last); };
   });
 
   let last = null, runId = 0;
   async function run() {
+    if (o.tab === 'sprint' && sprintDone) drawSprintResults();
     const my = ++runId;
     $('#o-status').innerHTML = '<div class="progress"><div></div></div>Simulating…';
-    const D = o.model === 'fit' ? fittedD() : 400;
+    const D = o.model === 'fit' ? fittedD() : o.model === 'new' ? Math.round(effectiveDivisor(o.botSigma)) : 400;
+    const firstMover = o.model === 'new' ? NEW_SYSTEM.firstMover : 0;
     const overrides = Object.fromEntries(Object.entries(o.overrides).map(([k, v]) => [Number(k), v]));
     try {
-      const res = await simulateOdds({ sims: o.sims, D, sigma: o.sigma, overrides, reseed: o.reseed });
+      const res = await simulateOdds({ sims: o.sims, D, sigma: o.sigma, overrides, reseed: o.reseed, firstMover });
       if (my !== runId || !main.contains($('#o-out'))) return;
       last = res;
-      $('#o-status').textContent = `${res.sims.toLocaleString()} simulated seasons in ${(res.ms / 1000).toFixed(1)}s · divisor ${D} · uncertainty ±${o.sigma}.`;
-      draw(res);
+      $('#o-status').textContent = `${res.sims.toLocaleString()} simulated seasons in ${(res.ms / 1000).toFixed(1)}s · ${o.model === 'new' ? `new system: effective divisor ${D}, +${firstMover} first mover` : `divisor ${D}`} · strength drift ±${o.sigma}.`;
+      if (!(o.tab === 'sprint' && sprintDone)) draw(res);
     } catch (err) {
       $('#o-status').textContent = `Simulation failed: ${err.message}`;
     }
+  }
+
+  function drawSprintResults() {
+    if (!sprintT?.rounds?.length) { $('#o-out').innerHTML = '<p class="muted">No Sprint bracket published.</p>'; return; }
+    const { out, upsets, R } = bracketResults(sprintT);
+    const me = myTeamId();
+    const by = (round) => [...out.entries()].filter(([, r]) => r.round === round).map(([id, r]) => ({ id, ...r }));
+    const champ = by(R)[0], final = by(R - 1), semis = by(R - 2), quarters = by(R - 3);
+    const nameOf = (id, fallback) => S.byId.get(id)?.name ?? fallback;
+    const line = (x) => `${teamLink(x.id, nameOf(x.id, x.self?.name))} <span class="muted small">seed ${sprintT.rounds[0].flatMap((m) => [m.a, m.b]).find((s) => s?.teamId === x.id)?.seed ?? '?'} · lost ${esc(x.score)} to ${esc(x.lostTo?.name ?? '?')}</span>`;
+    const mine = me != null ? out.get(me) : null;
+    $('#o-out').innerHTML = `
+      <div class="grid2">
+        <div class="card"><h3>Sprint results · ${day(sprintT.date)}</h3>
+          ${champ ? `<p style="font-size:18px;margin:.2rem 0 .6rem">🏆 ${teamLink(champ.id, nameOf(champ.id, champ.self?.name))} <span class="muted small">beat ${esc(champ.beat?.name ?? '?')} ${esc(champ.score)} in the final</span></p>` : '<p class="muted">The final hasn\'t been played.</p>'}
+          ${final.length ? `<p class="small"><b>Runner-up</b>: ${final.map(line).join('')}</p>` : ''}
+          ${semis.length ? `<p class="small"><b>Semifinalists</b>:<br>${semis.map(line).join('<br>')}</p>` : ''}
+          ${quarters.length ? `<p class="small"><b>Quarterfinalists</b>:<br>${quarters.map(line).join('<br>')}</p>` : ''}
+          ${mine ? `<p class="note small">Your team: ${mine.champion ? 'won the Sprint' : `went out in the ${esc(mine.label)}, ${esc(mine.score)} to ${esc(mine.lostTo?.name ?? '?')}`}.</p>` : ''}
+        </div>
+        <div class="card"><h3>Biggest upsets by seed</h3>
+          ${upsets.length ? `<ol class="small" style="margin:0;padding-left:20px">${upsets.slice(0, 8).map((u) => `<li>${teamLink(u.w.teamId, S.byId.get(u.w.teamId)?.name ?? u.w.name)} <span class="muted">(seed ${u.w.seed})</span> beat ${teamLink(u.l.teamId, S.byId.get(u.l.teamId)?.name ?? u.l.name)} <span class="muted">(seed ${u.l.seed})</span> ${u.w.score ?? ''}–${u.l.score ?? ''} · ${esc(u.label)}</li>`).join('')}</ol>` : '<p class="muted">None yet.</p>'}
+          <p class="muted small">Seeds came from the old rating system, before the 1 Oct reset.</p>
+        </div>
+      </div>`;
   }
 
   function draw(res) {
     const me = myTeamId();
     const elo = res.cfg.elo;
     if (o.tab === 'sprint') {
+      if (sprintDone) { drawSprintResults(); return; }
       if (!res.cfg.sprint) { $('#o-out').innerHTML = '<p class="muted">No Sprint bracket published.</p>'; return; }
       const R = res.sprintRounds;
       const rows = Object.entries(res.sprint).map(([id, c]) => ({ id: Number(id), c, win: c[R] / res.sims }))
@@ -692,31 +765,56 @@ function viewOdds(params) {
       const seedOf = res.cfg.sprint.seedOf;
       $('#o-out').innerHTML = `
         <div class="card"><h3>Most likely Sprint winners</h3>${hbars(rows.slice(0, 12).map((r) => ({ labelHtml: teamLink(r.id), value: r.win, cls: 's1' })))}</div>
-        <p class="muted small" style="margin-top:12px">${sprintT ? `${esc(sprintT.prize)} · every map unseen · best of ${sprintT.bestOf}. ` : ''}Columns are the chance of reaching each round.</p>
         ${oddsTable(rows.filter((r) => r.c[R - 4] > 0 || r.id === me).slice(0, 200), [
           { h: 'Seed', num: true, v: (r) => seedOf[r.id] ?? '—' },
           ...labels.map(([h, i]) => ({ h, num: true, v: (r) => pct(r.c[i] / res.sims), bar: i === R ? (r) => r.c[i] / res.sims : null })),
         ], elo, me, rows.length)}`;
-    } else {
-      if (!res.cfg.qualifier) { $('#o-out').innerHTML = '<p class="muted">No Qualifiers bracket published.</p>'; return; }
-      const rows = Object.entries(res.qual).map(([id, c]) => ({ id: Number(id), c, win: c[4] / res.sims, q: c[2] / res.sims }))
-        .sort((a, b) => b.win - a.win || b.q - a.q || elo[b.id] - elo[a.id]);
-      const seedOf = res.cfg.qualifier.seedOf;
-      $('#o-out').innerHTML = `
-        <div class="grid2">
-          <div class="card"><h3>Grand Final winner</h3>${hbars(rows.slice(0, 12).map((r) => ({ labelHtml: teamLink(r.id), value: r.win, cls: 's3' })))}</div>
-          <div class="card"><h3>Chance to qualify for the Grand Final</h3>${hbars([...rows].sort((a, b) => b.q - a.q).slice(0, 12).map((r) => ({ labelHtml: teamLink(r.id), value: r.q, cls: 's1' })), { max: 1 })}</div>
-        </div>
-        <p class="note" style="margin-top:12px">The Grand Final format isn't published yet. It's modelled as the 10 qualifiers seeded by rating into a single-elimination bracket (top six seeds get byes), best of ${gf?.bestOf || 5}. Qualifying odds don't depend on this.</p>
-        ${oddsTable(rows.filter((r) => r.q > 0 || r.id === me).slice(0, 200), [
-          { h: 'Q seed', num: true, v: (r) => seedOf[r.id] ?? '—' },
-          { h: 'Via QF', num: true, v: (r) => pct(r.c[0] / res.sims), t: 'Reach the Qualifiers quarterfinals' },
-          { h: 'Via losers', num: true, v: (r) => pct(r.c[1] / res.sims), t: 'Lose in the Round of 16, then reach the losers\' bracket final' },
-          { h: 'Qualify', num: true, v: (r) => pct(r.q), bar: (r) => r.q },
-          { h: 'GF final', num: true, v: (r) => pct(r.c[3] / res.sims) },
-          { h: 'Champion', num: true, v: (r) => pct(r.win) },
-        ], elo, me, rows.length)}`;
+      return;
     }
+    if (!res.cfg.qualifier) { $('#o-out').innerHTML = '<p class="muted">No Qualifiers bracket published yet.</p>'; return; }
+    const n = res.sims;
+    const rows = Object.entries(res.qual).map(([id, c]) => ({ id: Number(id), c, win: c[4] / n, q: c[2] / n }))
+      .sort((a, b) => b.win - a.win || b.q - a.q || elo[b.id] - elo[a.id]);
+    const seedOf = res.cfg.qualifier.seedOf;
+    const bySeed = new Map(Object.entries(seedOf).map(([id, sd]) => [sd, Number(id)]));
+    const hist = res.qualSeedHist || [];
+    const expTop10 = hist.reduce((a, k, i) => a + i * k, 0) / n;
+    const top1 = bySeed.get(1), top1q = top1 != null ? (res.qual[top1]?.[2] ?? 0) / n : null;
+    const mineQ = me != null && res.qual[me] ? res.qual[me][2] / n : null;
+    const favourite = rows[0];
+    const sched = (qualT.schedule || []).map((x) => `<li><b>${esc(x.when)}</b> · ${esc(x.what)}${x.detail ? ` <span class="muted">· ${esc(x.detail)}</span>` : ''}</li>`).join('');
+    $('#o-out').innerHTML = `
+      <div class="grid2">
+        <div class="card"><h3>Qualifiers · ${day(qualT.date)}</h3>
+          <p class="small ink2" style="margin-top:0">${esc(qualT.summary || '')}</p>
+          ${sched ? `<ul class="small" style="padding-left:18px;margin:0">${sched}</ul>` : ''}
+          <p class="muted small" style="margin-bottom:0">${qualT.size} eligible teams in the bracket${qualT.excluded ? `, ${qualT.excluded} more excluded by the site` : ''} · tentative until seeds lock after the autoscrims.</p></div>
+        <div class="card"><h3>Grand Final · ${day(gf?.date)}</h3>
+          <p class="small ink2" style="margin-top:0">${gf ? `${gf.teams} teams · best of ${gf.bestOf} · ${esc(gf.venue || '')} · ${esc(gf.prize || '')}` : '10 teams'}</p>
+          <p class="note small" style="margin-bottom:0">The site hasn't published the Grand Final bracket. It's modelled as the 10 qualifiers seeded by rating into a single-elimination bracket (top six get byes), best of ${gf?.bestOf || 5}. Qualifying odds don't depend on this.</p></div>
+      </div>
+      <div class="tiles">
+        <div class="tile"><div class="k">Favourite to win it all</div><div class="v">${pct(favourite?.win ?? 0)}</div><div class="s">${favourite ? teamLink(favourite.id) : '—'}</div></div>
+        <div class="tile"><div class="k">Top seed qualifies</div><div class="v">${top1q == null ? '—' : pct(top1q)}</div><div class="s">${top1 != null ? teamLink(top1) : ''}</div></div>
+        <div class="tile"><div class="k">Seeds 1–10 that qualify</div><div class="v">${expTop10.toFixed(1)}</div><div class="s">expected, of the 10 places</div></div>
+        <div class="tile"><div class="k">A seed 17+ qualifies</div><div class="v">${res.qualLongshot != null ? pct(res.qualLongshot / n) : '—'}</div><div class="s">at least one long shot</div></div>
+        ${mineQ != null ? `<div class="tile"><div class="k">You qualify</div><div class="v">${pct(mineQ)}</div><div class="s">${teamLink(me)} · seed ${seedOf[me] ?? '—'}</div></div>` : ''}
+      </div>
+      <div class="grid2">
+        <div class="card"><h3>Grand Final winner</h3>${hbars(rows.slice(0, 12).map((r) => ({ labelHtml: teamLink(r.id), value: r.win, cls: 's3' })))}</div>
+        <div class="card"><h3>Chance to qualify for the Grand Final</h3>${hbars([...rows].sort((a, b) => b.q - a.q).slice(0, 12).map((r) => ({ labelHtml: teamLink(r.id), value: r.q, cls: 's1' })), { max: 1 })}</div>
+      </div>
+      ${hist.length ? `<div class="card" style="margin-top:14px"><h3>How many of seeds 1–10 qualify</h3>${hbars(hist.map((k, i) => ({ label: `${i} of 10`, value: k / n, cls: 's2' })).filter((x, i) => x.value > 0.001 || i === 10).reverse(), { max: Math.max(...hist) / n })}</div>` : ''}
+      ${oddsTable(rows.filter((r) => r.q > 0 || r.id === me).slice(0, 200), [
+        { h: 'Seed', num: true, v: (r) => seedOf[r.id] ?? '—', t: 'Tentative Qualifiers seed' },
+        { h: 'Round of 16', num: true, v: (r) => pct((r.c[6] ?? 0) / n), t: 'Reach the last 16' },
+        { h: 'Via QF', num: true, v: (r) => pct(r.c[0] / n), t: 'Reach the quarterfinals (qualifies directly)' },
+        { h: 'Via 2nd chance', num: true, v: (r) => pct(r.c[1] / n), t: 'Lose in the Round of 16, then reach the second-chance final' },
+        { h: 'Qualify', num: true, v: (r) => pct(r.q), bar: (r) => r.q },
+        { h: 'Win Qualifiers', num: true, v: (r) => pct(r.c[5] / n) },
+        { h: 'GF final', num: true, v: (r) => pct(r.c[3] / n) },
+        { h: 'Champion', num: true, v: (r) => pct(r.win) },
+      ], elo, me, rows.length)}`;
   }
   run();
 }
@@ -1174,7 +1272,8 @@ function viewAbout() {
     <h3>Map Elo</h3>
     <p>A team's map Elo is its current official Elo plus an offset for how much better or worse it does on that map than on its others. The offsets are fitted from every ranked and tournament game in the chosen window, against each opponent's official Elo at the time, and shrunk towards 0 so a few games can't produce a wild number. The <a href="#/maps">Map Elo</a> page explains the model and shows how much it improves predictions.</p>
     <h3>Odds</h3>
-    <p>Per-game win probability is the Elo expectation 1 / (1 + 10<sup>(R<sub>B</sub> − R<sub>A</sub>)/D</sup>), with D = 400 as on the site or D fitted to recent ranked games. Series odds treat games as independent (draws ignored). Rating changes use the site's rule: K falls from 96 for a new submission to 24 after 10 ranked battles. Tournament odds simulate the site's tentative brackets, which are re-seeded from the ladder after the final autoscrims, so they will shift. The optional rating uncertainty draws each team's strength from Elo ± σ once per simulated season. The Grand Final format is an assumption, noted on that page.</p>
+    <p><b>Ratings since 1 October.</b> The site reset every rating and moved to a new system (<a href="${SITE}/docs/elo" rel="noopener">its docs</a>): each submission has an overall rating plus an offset on every map, each with a σ for how sure the site is, and a team's ladder rating is its active bot's rating averaged over the ranked map pool. A game is predicted as 1 / (1 + e<sup>−z/s</sup>), where z is the rating gap (ln 10 / 400 per point, +20 for moving first) and s = √(1 + πv/8) grows with the σs. Settled bots barely move; new ones move fast. Tiers moved too: Shark is now 1900–2299, Swordfish 1500–1899 and so on.</p>
+    <p><b>Odds.</b> By default the odds use that formula. Tournament maps are all unseen, so each bot's offset there is 0 ± 150, which with ±60 on each bot's rating acts like an Elo divisor of about 518 instead of 400; ranked games on pool maps act like about 418. Who moves first is averaged both ways. You can switch to plain divisor-400 Elo, or a divisor fitted to recent ranked games. Series odds treat games as independent (draws ignored). Rating changes aren't predicted any more, since they depend on σs the site doesn't publish. Tournament odds simulate the site's tentative brackets, which are re-seeded from the ladder after the final autoscrims, so they will shift. The optional strength drift draws each team's strength from its rating ± σ once per simulated season. The Grand Final format is an assumption, noted on that page.</p>
     <h3>Caveats</h3>
     <ul>
       <li>Battle Elo figures are the ones listed with the battle on the site.</li>

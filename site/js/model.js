@@ -1,15 +1,41 @@
 // Elo arithmetic, series probabilities and bracket simulation.
 // Shared by the page and the simulation worker, so no DOM here.
 
+// Tiers as of the 1 Oct rating reset (docs/elo).
 export const TIERS = [
-  { name: 'Fishing Boat', min: 2800 }, { name: 'Leviathan', min: 2500 }, { name: 'Orca', min: 2200 },
-  { name: 'Shark', min: 1900 }, { name: 'Swordfish', min: 1600 }, { name: 'Tunafish', min: 1300 },
-  { name: 'Shrimp', min: 1000 }, { name: 'Plankton', min: -Infinity },
+  { name: 'Fishing Boat', min: 3000 }, { name: 'Leviathan', min: 2700 }, { name: 'Orca', min: 2300 },
+  { name: 'Shark', min: 1900 }, { name: 'Swordfish', min: 1500 }, { name: 'Tunafish', min: 1100 },
+  { name: 'Shrimp', min: 700 }, { name: 'Plankton', min: -Infinity },
 ];
 export const tierOf = (elo) => TIERS.find((t) => elo >= t.min).name;
 
 /** Expected share of games for A (also the per-game win probability, ignoring draws). */
 export const expected = (ra, rb, D = 400) => 1 / (1 + 10 ** ((rb - ra) / D));
+
+// ---- the site's rating system since the 1 Oct reset (game.battlecode.au/docs/elo) ----
+// Every submission has an overall rating and an offset on each map, each a mean
+// with a σ for how unsure it is. A game on map m is predicted from
+//   z = c·(R_A + O_A,m − R_B − O_B,m + 20 for whoever moves first),  c = ln10/400
+//   v = c²·(sum of the four σ²),  s = √(1 + πv/8),  P(A) = 1/(1 + e^(−z/s))
+// so uncertainty pulls predictions towards 50%, exactly like widening the Elo
+// divisor from 400 to 400·s. A team's ladder rating is its active submission's
+// rating averaged over the ranked map pool.
+export const NEW_SYSTEM = { firstMover: 20, unseenMapSigma: 150, newBotSigma: 200, newSubmissionExtra: 75 };
+const C = Math.LN10 / 400;
+/** Spread factor s for a game, from the σs (in rating points) of the numbers involved. */
+export const spreadFactor = (sigmas) => Math.sqrt(1 + (Math.PI * C * C * sigmas.reduce((a, x) => a + x * x, 0)) / 8);
+/**
+ * Effective Elo divisor for a game between two bots whose overall ratings are
+ * each ± sigmaBot. On an unseen map (every Sprint and Qualifier map) each bot's
+ * offset there is still 0 ± 150, which widens it further.
+ */
+export const effectiveDivisor = (sigmaBot = 60, unseen = true) =>
+  400 * spreadFactor(unseen ? [sigmaBot, sigmaBot, NEW_SYSTEM.unseenMapSigma, NEW_SYSTEM.unseenMapSigma] : [sigmaBot, sigmaBot]);
+/** P(A wins a series) when one side moves first in every game and we don't know which: average both. */
+export const seriesWithFirstMover = (series, gap, D, fm = 0) => {
+  const f = (g) => 1 / (1 + 10 ** (-g / D));
+  return fm ? 0.5 * (series(f(gap + fm)) + series(f(gap - fm))) : series(f(gap));
+};
 
 /** Site rule: a submission's K falls evenly from 96 (0 ranked battles) to 24 (10+). */
 export const kForCount = (n) => (n >= 10 ? 24 : 96 - 7.2 * n);
@@ -40,8 +66,8 @@ export function firstTo(p, need) {
 }
 
 // Fast closed forms used inside the simulation loop.
-const ft3 = (p) => { const q = 1 - p; return p * p * p * (1 + 3 * q + 6 * q * q); };
-const ft4 = (p) => { const q = 1 - p; return p * p * p * p * (1 + 4 * q + 10 * q * q + 20 * q * q * q); };
+export const ft3 = (p) => { const q = 1 - p; return p * p * p * (1 + 3 * q + 6 * q * q); };
+export const ft4 = (p) => { const q = 1 - p; return p * p * p * p * (1 + 4 * q + 10 * q * q + 20 * q * q * q); };
 export const seriesFn = (bestOf) => (bestOf === 7 ? ft4 : bestOf === 5 ? ft3 : (p) => firstTo(p, Math.ceil(bestOf / 2)));
 
 /** Standard bracket order: seeds for each slot of a 2^k bracket (1 v n, n/2 v n/2+1, ...). */
@@ -112,13 +138,17 @@ export function simulate(cfg) {
 
   const sprintRounds = sprint ? sprint.rounds : 0;
   const sprintReach = new Map(); // id -> Int32Array(rounds+1): reached round r (0 = entered)
-  const qualOut = new Map();     // id -> Int32Array(6): [qfDirect, loserQual, qualified, gfFinal, gfWin, qualWin]
+  const qualOut = new Map();     // id -> Int32Array(7): [qfDirect, loserQual, qualified, gfFinal, gfWin, qualWin, reachR16]
+  const QN = 7;
+  const qualSeedHist = new Int32Array(11); // per season: how many of seeds 1–10 qualify
+  let qualLongshot = 0;                    // seasons where someone seeded 17+ qualifies
   const bump = (map, id, len, i) => {
     let a = map.get(id);
     if (!a) { a = new Int32Array(len); map.set(id, a); }
     a[i]++;
   };
 
+  const fm = cfg.firstMover ?? 0; // rating points for moving first; who moves first is unknown, so average
   function prob(a, b, series) {
     const sa = strength[index.get(a)], sb = strength[index.get(b)];
     if (sigma === 0) {
@@ -126,10 +156,10 @@ export function simulate(cfg) {
       if (!cache) caches.set(series, (cache = new Map()));
       const key = a * 100003 + b;
       let v = cache.get(key);
-      if (v === undefined) { v = series(1 / (1 + 10 ** ((sb - sa) / D))); cache.set(key, v); }
+      if (v === undefined) { v = seriesWithFirstMover(series, sa - sb, D, fm); cache.set(key, v); }
       return v;
     }
-    return series(1 / (1 + 10 ** ((sb - sa) / D)));
+    return seriesWithFirstMover(series, sa - sb, D, fm);
   }
 
   // Plays a knockout from `slots`; calls onRound(r, winners, losers) after each round.
@@ -167,9 +197,10 @@ export function simulate(cfg) {
       let r16Losers = [];
       const qfTeams = [];
       const qualWinner = play(qual, (r, winners, losers) => {
+        if (r === r16 - 1) for (const w of winners) if (w != null) bump(qualOut, w, QN, 6);
         if (r === r16) { qfTeams.push(...winners.filter((w) => w != null)); r16Losers = losers.map((l) => l.id); }
       });
-      if (qualWinner != null) bump(qualOut, qualWinner, 6, 5);
+      if (qualWinner != null) bump(qualOut, qualWinner, QN, 5);
       // Loser bracket: R16 losers reseeded by original seed, 1v8 4v5 2v7 3v6; the two semi winners qualify.
       const L = r16Losers.sort((a, b) => qual.seedOf[a] - qual.seedOf[b]);
       const lr = [];
@@ -182,8 +213,19 @@ export function simulate(cfg) {
         const a = lr[x], b = lr[y];
         lq.push(a == null || b == null ? a ?? b : rand() < prob(a, b, qual.series) ? a : b);
       }
-      for (const id of qfTeams) { bump(qualOut, id, 6, 0); bump(qualOut, id, 6, 2); }
-      for (const id of lq) if (id != null) { bump(qualOut, id, 6, 1); bump(qualOut, id, 6, 2); }
+      for (const id of qfTeams) { bump(qualOut, id, QN, 0); bump(qualOut, id, QN, 2); }
+      for (const id of lq) if (id != null) { bump(qualOut, id, QN, 1); bump(qualOut, id, QN, 2); }
+      {
+        let top10 = 0, longshot = false;
+        for (const id of [...qfTeams, ...lq]) {
+          if (id == null) continue;
+          const sd = qual.seedOf[id];
+          if (sd <= 10) top10++;
+          if (sd > 16) longshot = true;
+        }
+        qualSeedHist[top10]++;
+        if (longshot) qualLongshot++;
+      }
 
       // Grand Final (assumed format): the qualifiers seeded by rating into a
       // 16-slot single-elimination bracket, so the top six get byes.
@@ -195,16 +237,17 @@ export function simulate(cfg) {
         for (let m = 0; m < cur.length; m += 2) {
           const a = cur[m], b = cur[m + 1];
           next.push(a == null || b == null ? a ?? b : rand() < prob(a, b, gfSeries) ? a : b);
-          if (cur.length === 2) for (const f of [a, b]) if (f != null) bump(qualOut, f, 6, 3);
+          if (cur.length === 2) for (const f of [a, b]) if (f != null) bump(qualOut, f, QN, 3);
         }
         cur = next;
       }
-      if (cur[0] != null) bump(qualOut, cur[0], 6, 4);
+      if (cur[0] != null) bump(qualOut, cur[0], QN, 4);
     }
   }
 
   const toObj = (map) => Object.fromEntries([...map.entries()].map(([k, v]) => [k, Array.from(v)]));
-  return { sims: cfg.sims, sprintRounds, sprint: toObj(sprintReach), qual: toObj(qualOut) };
+  return { sims: cfg.sims, sprintRounds, sprint: toObj(sprintReach), qual: toObj(qualOut),
+    qualSeedHist: qual ? Array.from(qualSeedHist) : null, qualLongshot: qual ? qualLongshot : null };
 
   function prepBracket(b) {
     let rounds = 0;

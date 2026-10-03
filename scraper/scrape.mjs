@@ -100,15 +100,19 @@ async function fetchLeaderboard() {
 
 // ---- 2. tournaments -----------------------------------------------------------
 async function fetchTournaments() {
+  // The list only shows the tab you're on (the Sprint by default), but its
+  // firstNumber map names every event with a bracket (sprint, qualifier, and
+  // secondChance, which is the Qualifiers' losers' bracket and has no page).
   const list = await pageData('/tournaments');
+  const ids = [...new Set([...(list.tournaments || []).map((t) => t.id), ...Object.keys(list.firstNumber || {})])];
   const out = [];
-  for (const t of list.tournaments) {
+  for (const id of ids) {
     try {
-      const d = await pageData(`/tournaments/${t.id}`);
-      out.push({ ...d.tournament, cut: d.cut ?? [] });
+      const d = await pageData(`/tournaments/${id}`);
+      if (d?.tournament) out.push({ ...d.tournament, cut: d.cut ?? [] });
     } catch (err) {
-      log(`tournament ${t.id}: ${err.message}`);
-      out.push(t);
+      const listed = (list.tournaments || []).find((t) => t.id === id);
+      if (listed) { log(`tournament ${id}: ${err.message}`); out.push(listed); }
     }
   }
   return out;
@@ -375,8 +379,9 @@ async function fetchGames(games, gcur) {
 }
 
 // ---- 7. derived outputs -------------------------------------------------------------
-const TIERS = [[2800, 'Fishing Boat'], [2500, 'Leviathan'], [2200, 'Orca'], [1900, 'Shark'],
-  [1600, 'Swordfish'], [1300, 'Tunafish'], [1000, 'Shrimp'], [-Infinity, 'Plankton']];
+// Tiers as of the 1 Oct rating reset (game.battlecode.au/docs/elo).
+const TIERS = [[3000, 'Fishing Boat'], [2700, 'Leviathan'], [2300, 'Orca'], [1900, 'Shark'],
+  [1500, 'Swordfish'], [1100, 'Tunafish'], [700, 'Shrimp'], [-Infinity, 'Plankton']];
 
 function eloAt(history, t) {
   // history: [[t, elo]] ascending. Rating in force at time t.
