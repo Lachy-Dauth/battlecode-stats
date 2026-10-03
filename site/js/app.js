@@ -796,7 +796,7 @@ function viewOdds(params) {
           <p class="muted small" style="margin-bottom:0">${qualT.size} eligible teams in the bracket${qualT.excluded ? `, ${qualT.excluded} more excluded by the site` : ''} · tentative until seeds lock after the autoscrims.</p></div>
         <div class="card"><h3>Grand Final · ${day(gf?.date)}</h3>
           <p class="small ink2" style="margin-top:0">${gf ? `${gf.teams} teams · best of ${gf.bestOf} · ${esc(gf.venue || '')} · ${esc(gf.prize || '')}` : '10 teams'}</p>
-          <p class="note small" style="margin-bottom:0">The site hasn't published the Grand Final bracket. It's modelled as the 10 qualifiers seeded by rating into a single-elimination bracket (top six get byes), best of ${gf?.bestOf || 5}. Qualifying odds don't depend on this.</p></div>
+          <p class="note small" style="margin-bottom:0"><b>Best guess:</b> the Grand Final format isn't published yet, so this is guessed as the 10 qualifiers seeded by rating into a single-elimination bracket (top six get byes), best of ${gf?.bestOf || 5}. Qualifying odds don't depend on this.</p></div>
       </div>
       <div class="tiles">
         <div class="tile"><div class="k">Favourite to win it all</div><div class="v">${pct(favourite?.win ?? 0)}</div><div class="s">${favourite ? teamLink(favourite.id) : '—'}</div></div>
