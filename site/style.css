@@ -281,3 +281,10 @@ details summary { cursor: pointer; color: var(--ink-2); }
   .chart .line { stroke: CanvasText; }
   .hbar-fill, .dist .barwrap div, .mbar .fill { background: CanvasText; }
 }
+
+/* Wide pages: the map grid needs room for every map column. */
+body.wide .wrap { max-width: min(2200px, 100%); }
+.heat th.map { min-width: 58px; }
+.xvs { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); gap: 14px; }
+.xvs ol { margin: 6px 0 0; padding: 0; list-style: none; }
+.xvs li { display: grid; grid-template-columns: minmax(0,1fr) auto auto; gap: 10px; padding: 4px 0; border-top: 1px solid var(--line, rgba(127,127,127,.2)); align-items: baseline; }

@@ -434,6 +434,8 @@ async function viewTeam(id) {
     <p class="muted small">Bots aren't public, but every match records which submission each side used. Active bots come from ranked battles, which always use each team's active submission. The record counts battles seen with that bot, plus ranked battles between two sightings of it.</p>
     <div id="subs"></div>
     <div id="tested"></div>
+    <h2>Matchups vs Elo</h2>
+    <div id="xvs"></div>
     <h2>Head to head</h2>
     <div id="h2h"></div>
     <div class="grid2">
@@ -509,6 +511,9 @@ async function viewTeam(id) {
       { key: 'last', get: (h) => h.last },
     ], state, body);
   } else $('#h2h').innerHTML = '<p class="muted">No battles recorded yet.</p>';
+
+  // Opponents this team beats more (or less) often than the ratings say it should.
+  $('#xvs').innerHTML = matchupStyleHtml(t, d?.battles || []);
 
   // Maps
   teamMaps(t);
@@ -1190,6 +1195,46 @@ async function viewMaps() {
   render();
 }
 
+/**
+ * Opponents a team over- or under-performs against, relative to Elo. For every recorded
+ * ranked/tournament battle, expected games won come from both sides' ratings at the time
+ * (the new system's divisor for seen maps). Each opponent's surplus is shrunk towards 0
+ * with a prior worth PRIOR_GAMES games, and converted to an Elo-equivalent edge.
+ */
+function matchupStyleHtml(t, battles) {
+  const D = effectiveDivisor(NEW_MODEL.botSigma, false);
+  const PRIOR_GAMES = 15;
+  const by = new Map();
+  for (const b of battles) {
+    if ((!b.ranked && b.challenge) || b.myElo == null || b.oppElo == null) continue;
+    const n = b.w + b.l + b.d;
+    if (!n) continue;
+    const p = 1 / (1 + 10 ** (-(b.myElo - b.oppElo) / D));
+    const o = by.get(b.opp) || { opp: b.opp, n: 0, won: 0, exp: 0, battles: 0 };
+    o.n += n; o.won += b.w + b.d / 2; o.exp += n * p; o.battles++;
+    by.set(b.opp, o);
+  }
+  const rows = [...by.values()].filter((o) => o.n >= 5).map((o) => {
+    const pe = o.exp / o.n;
+    const shrunk = (o.won + PRIOR_GAMES * pe) / (o.n + PRIOR_GAMES);   // pulled towards what Elo expects
+    const lg = (x) => Math.log10(Math.min(0.99, Math.max(0.01, x)) / (1 - Math.min(0.99, Math.max(0.01, x))));
+    return { ...o, edge: Math.round(D * (lg(shrunk) - lg(pe))), name: S.byId.get(o.opp)?.name ?? `Team ${o.opp}` };
+  });
+  if (rows.length < 3) return '<p class="muted">Not enough recent rated battles against repeat opponents yet.</p>';
+  const li = (o) => `<li><span class="team">${teamLink(o.opp, o.name)}</span>
+    <span class="num small muted" title="Games won (draws count half) vs expected from ratings at the time">${+o.won.toFixed(1)} won / ${o.exp.toFixed(1)} expected · ${o.n} games</span>
+    <span class="num"><b>${signed(o.edge)}</b></span></li>`;
+  const strong = rows.filter((o) => o.edge > 0).sort((a, b) => b.edge - a.edge).slice(0, 6);
+  const weak = rows.filter((o) => o.edge < 0).sort((a, b) => a.edge - b.edge).slice(0, 6);
+  return `<div class="xvs">
+    <div class="card"><h3 style="margin:0">Stronger than Elo says</h3><div class="muted small">Win more games than the rating gap predicts</div>
+      ${strong.length ? `<ol>${strong.map(li).join('')}</ol>` : '<p class="muted small">None stand out.</p>'}</div>
+    <div class="card"><h3 style="margin:0">Weaker than Elo says</h3><div class="muted small">Win fewer games than the rating gap predicts</div>
+      ${weak.length ? `<ol>${weak.map(li).join('')}</ol>` : '<p class="muted small">None stand out.</p>'}</div>
+  </div>
+  <p class="muted small">From the last ${battles.length} recorded battles (ranked and tournament). The number is an Elo-equivalent edge in that matchup, shrunk towards 0 so a few lucky games don't dominate; at least 5 games needed. Small edges are mostly noise. Opponents may have changed bots since.</p>`;
+}
+
 /** Team page: map Elo as bars around the team's usual level. */
 async function teamMaps(t) {
   const host = $('#maps');
@@ -1292,6 +1337,7 @@ function route() {
   const path = p || '/';
   const nav = path.startsWith('/team/') ? 'leaderboard' : path.slice(1) || 'leaderboard';
   $$('.nav a').forEach((a) => a.classList.toggle('active', a.dataset.nav === nav));
+  document.body.classList.toggle('wide', path === '/maps');
   window.scrollTo(0, 0);
   let m;
   if ((m = path.match(/^\/team\/(\d+)/))) viewTeam(Number(m[1]));
