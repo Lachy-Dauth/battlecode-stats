@@ -18,6 +18,25 @@ const store = {
   set(k, v) { try { localStorage.setItem(`bcs.${k}`, JSON.stringify(v)); } catch {} },
 };
 
+// During a live event scripts/live.sh pushes fresh brackets to the `live` branch;
+// use them when they're newer than the hourly snapshot.
+const LIVE_URL = 'https://raw.githubusercontent.com/Lachy-Dauth/battlecode-stats/live/tournaments.json';
+async function getTournaments(snapshot) {
+  try {
+    const r = await fetch(`${LIVE_URL}?t=${Math.floor(Date.now() / 60000)}`, { cache: 'no-cache' });
+    if (r.ok) {
+      const live = await r.json();
+      if ((live.fetchedAt || 0) > (snapshot?.fetchedAt || 0)) return { ...live, live: true };
+    }
+  } catch {}
+  return snapshot;
+}
+async function refreshTournaments() {
+  const before = S.tour?.fetchedAt;
+  S.tour = await getTournaments(S.tour);
+  if (S.tour?.fetchedAt !== before) { S.defaultOdds = null; return true; }
+  return false;
+}
 async function getJSON(p) {
   const r = await fetch(`data/${p}`, { cache: 'no-cache' });
   if (!r.ok) throw new Error(`${p}: HTTP ${r.status}`);
@@ -165,12 +184,12 @@ function simWorker() {
   return worker;
 }
 
-function bracketCfg(t, elo, reseed) {
+function bracketCfg(t, elo, reseed, preferBracket = null) {
   const entrants = [];
   for (const m of t.rounds?.[0] || []) for (const s of [m.a, m.b]) {
     if (s?.teamId == null) continue;
     entrants.push({ id: s.teamId, seed: s.seed });
-    if (elo[s.teamId] == null) elo[s.teamId] = s.elo ?? 1500; // registered after the leaderboard was read
+    if (elo[s.teamId] == null || (preferBracket && s.elo != null && !(s.teamId in preferBracket))) elo[s.teamId] = s.elo ?? elo[s.teamId] ?? 1500; // registered after the leaderboard was read, or a fresher bracket rating
   }
   if (!entrants.length) return null;
   let slots, seedOf = {};
@@ -192,11 +211,13 @@ function bracketCfg(t, elo, reseed) {
       if (w != null) (forced[r] ||= [])[i] = w;
     }));
   }
-  return { slots, bestOf: t.bestOf || 7, forced, seedOf };
+  // Second-chance results, in the site's order (1v8, 4v5, 2v7, 3v6, then winners in order).
+  const losersForced = (t.losersRounds || []).map((round) => round.map((m) => (m.winner === 'a' ? m.a?.teamId : m.winner === 'b' ? m.b?.teamId : null) ?? null));
+  return { slots, bestOf: t.bestOf || 7, forced, seedOf, losersForced };
 }
 
 function simulateOdds({ sims = 5000, D = 400, sigma = 0, overrides = {}, reseed = false, firstMover = 0 } = {}) {
-  const key = JSON.stringify({ sims, D, sigma, overrides, reseed, firstMover, u: S.meta?.updatedAt });
+  const key = JSON.stringify({ sims, D, sigma, overrides, reseed, firstMover, u: S.meta?.updatedAt, b: S.tour?.fetchedAt });
   if (S.oddsCache.has(key)) return S.oddsCache.get(key);
   const elo = {};
   for (const t of S.teams) elo[t.id] = overrides[t.id] ?? t.elo;
@@ -205,7 +226,7 @@ function simulateOdds({ sims = 5000, D = 400, sigma = 0, overrides = {}, reseed 
   const cfg = {
     sims, D, sigma, firstMover, seed: 20261017, elo,
     sprint: sprintT && !tournamentDone(sprintT) ? bracketCfg(sprintT, elo, reseed) : null,
-    qualifier: qualT ? bracketCfg(qualT, elo, reseed) : null,
+    qualifier: qualT ? bracketCfg(qualT, elo, reseed, overrides) : null,
     grandFinal: { bestOf: S.tour?.grandFinal?.bestOf || 5, size: S.tour?.grandFinal?.teams || 10 },
   };
   const id = ++jobId;
@@ -651,7 +672,7 @@ function viewOdds(params) {
   const sprintDone = tournamentDone(sprintT);
   main.innerHTML = `
     <h1>Tournament odds</h1>
-    <p class="lede">Monte Carlo over the site's own brackets, seeded from the current ladder. The championship path is the <b>Qualifiers</b>
+    <p class="lede">Monte Carlo over the site's own brackets and seeds, with results fixed as they come in (<a href="#/bracket">see the bracket</a>). The championship path is the <b>Qualifiers</b>
     (${qualT ? `${qualT.size} APAC teams, best of ${qualT.bestOf}, ${day(qualT.date)}` : 'APAC teams'}; the eight quarterfinalists plus two from the Round-of-16 losers' bracket go through)
     into the <b>Grand Final</b> (${gf ? `${gf.teams} teams, best of ${gf.bestOf}, ${day(gf.date)}` : '10 teams'}).</p>
     <div class="card">
@@ -665,7 +686,6 @@ function viewOdds(params) {
         </div>
         <label id="o-bot-wrap" title="How unsure each bot's overall rating is (the site doesn't publish it). New bots start at ±200; settled ones shrink towards ±30">Bot rating ±<select id="o-bot">${[30, 60, 100, 200].map((n) => `<option value="${n}" ${n === o.botSigma ? 'selected' : ''}>${n}</option>`).join('')}</select></label>
         <label title="Each simulated season draws every team's true strength from its rating ± this much, for bots improving or slipping before the event">Strength drift ±<input id="o-sigma" type="range" min="0" max="200" step="10" value="${o.sigma}"><span id="o-sigma-v" class="num">${o.sigma}</span></label>
-        <label class="chip" title="Re-seed the brackets from ratings including your what-ifs, instead of the site's current bracket"><input type="checkbox" id="o-reseed" ${o.reseed ? 'checked' : ''}>Re-seed brackets</label>
       </div>
       <details ${Object.keys(o.overrides).length ? 'open' : ''}><summary>What if… (override a team's rating)</summary>
         <div class="controls"><input id="wi-team" list="teamlist" placeholder="Team…" autocomplete="off"><input id="wi-elo" type="number" placeholder="Rating" style="width:90px"><button class="btn" id="wi-add" type="button">Apply</button></div>
@@ -696,7 +716,6 @@ function viewOdds(params) {
   });
   $('#o-bot').onchange = (e) => { o.botSigma = Number(e.target.value); save(); rerun(); };
   $('#o-sigma').oninput = (e) => { o.sigma = Number(e.target.value); $('#o-sigma-v').textContent = o.sigma; save(); rerun(); };
-  $('#o-reseed').onchange = (e) => { o.reseed = e.target.checked; save(); rerun(); };
   const drawWI = () => {
     $('#wi-list').innerHTML = Object.entries(o.overrides).map(([id, e]) => `<span class="whatif">${esc(S.byId.get(Number(id))?.name ?? id)}: ${S.byId.get(Number(id))?.elo ?? '?'} → <b>${e}</b><button data-rm="${id}" aria-label="Remove">✕</button></span>`).join('') || '<span class="muted small">None. Try giving your own team +100.</span>';
     $$('[data-rm]', $('#wi-list')).forEach((b) => { b.onclick = () => { delete o.overrides[b.dataset.rm]; save(); drawWI(); rerun(); }; });
@@ -722,7 +741,7 @@ function viewOdds(params) {
     const firstMover = o.model === 'new' ? NEW_SYSTEM.firstMover : 0;
     const overrides = Object.fromEntries(Object.entries(o.overrides).map(([k, v]) => [Number(k), v]));
     try {
-      const res = await simulateOdds({ sims: o.sims, D, sigma: o.sigma, overrides, reseed: o.reseed, firstMover });
+      const res = await simulateOdds({ sims: o.sims, D, sigma: o.sigma, overrides, reseed: false, firstMover });
       if (my !== runId || !main.contains($('#o-out'))) return;
       last = res;
       $('#o-status').textContent = `${res.sims.toLocaleString()} simulated seasons in ${(res.ms / 1000).toFixed(1)}s · ${o.model === 'new' ? `new system: effective divisor ${D}, +${firstMover} first mover` : `divisor ${D}`} · strength drift ±${o.sigma}.`;
@@ -793,7 +812,7 @@ function viewOdds(params) {
         <div class="card"><h3>Qualifiers · ${day(qualT.date)}</h3>
           <p class="small ink2" style="margin-top:0">${esc(qualT.summary || '')}</p>
           ${sched ? `<ul class="small" style="padding-left:18px;margin:0">${sched}</ul>` : ''}
-          <p class="muted small" style="margin-bottom:0">${qualT.size} eligible teams in the bracket${qualT.excluded ? `, ${qualT.excluded} more excluded by the site` : ''} · tentative until seeds lock after the autoscrims.</p></div>
+          <p class="muted small" style="margin-bottom:0">${qualT.size} eligible teams in the bracket${qualT.excluded ? `, ${qualT.excluded} more excluded by the site` : ''}${qualT.status === 'upcoming' ? '' : ` · ${esc(qualT.status)}`} · <a href="#/bracket">Inspect the bracket →</a></p></div>
         <div class="card"><h3>Grand Final · ${day(gf?.date)}</h3>
           <p class="small ink2" style="margin-top:0">${gf ? `${gf.teams} teams · best of ${gf.bestOf} · ${esc(gf.venue || '')} · ${esc(gf.prize || '')}` : '10 teams'}</p>
           <p class="note small" style="margin-bottom:0"><b>Best guess:</b> the Grand Final format isn't published yet, so this is guessed as the 10 qualifiers seeded by rating into a single-elimination bracket (top six get byes), best of ${gf?.bestOf || 5}. Qualifying odds don't depend on this.</p></div>
@@ -997,6 +1016,223 @@ function calibrationChart(host, cal) {
   };
   draw();
   new ResizeObserver(draw).observe(host);
+}
+
+// ---- bracket ------------------------------------------------------------------------
+// The Qualifiers bracket as the site publishes it, with results as they come in
+// (scripts/live.sh pushes fresh brackets every few minutes during the event).
+// The bracket's ratings are read with it (every few minutes during the event), so they win over the hourly ladder.
+const seriesP = (aId, bId, aElo, bElo, bestOf) => {
+  const ea = aElo ?? S.byId.get(aId)?.elo ?? 1500, eb = bElo ?? S.byId.get(bId)?.elo ?? 1500;
+  return seriesWithFirstMover((x) => firstTo(x, Math.ceil(bestOf / 2)), ea - eb, effectiveDivisor(NEW_MODEL.botSigma, true), NEW_SYSTEM.firstMover);
+};
+const gameP = (aId, bId, aElo, bElo) => {
+  const ea = aElo ?? S.byId.get(aId)?.elo ?? 1500, eb = bElo ?? S.byId.get(bId)?.elo ?? 1500;
+  return seriesWithFirstMover((x) => x, ea - eb, effectiveDivisor(NEW_MODEL.botSigma, true), NEW_SYSTEM.firstMover);
+};
+/** Match state: done (winner known), live (games played, no winner yet), ready (both known), waiting. */
+function matchState(m) {
+  if (m.bye) return 'bye';
+  if (m.winner) return 'done';
+  if (m.a && m.b) return m.games?.length ? 'live' : 'ready';
+  return 'waiting';
+}
+const scoreOf = (m, side) => m[side]?.score ?? (m.games || []).filter((g) => g.winner === side).length;
+
+function viewBracket(params) {
+  const t = S.tour?.tournaments?.find((x) => x.id === 'qualifier');
+  if (!t?.rounds?.length) { main.innerHTML = '<h1>Bracket</h1><p class="muted">No Qualifiers bracket published yet.</p>'; return; }
+  const st = Object.assign({ side: 'main', round: null, q: '', byes: false, path: false }, store.get('bracket', {}));
+  if (params.get('side')) st.side = params.get('side');
+  const save = () => store.set('bracket', { side: st.side, round: st.round, byes: st.byes, path: st.path });
+  const bestOf = t.bestOf || 7;
+  let openKey = null;
+
+  const R = t.rounds.length;
+  const roundName = (r) => { const left = 2 ** (R - r); return left === 2 ? 'Final' : left === 4 ? 'Semifinals' : left === 8 ? 'Quarterfinals' : r === 0 ? `Opening round` : `Round of ${left}`; };
+  const treeFrom = R - 4; // Round of 16
+  const early = [...Array(treeFrom).keys()];
+  if (st.round == null || st.round >= treeFrom) {
+    // Default to the earliest round still being played.
+    st.round = early.find((r) => t.rounds[r].some((m) => ['live', 'ready'].includes(matchState(m)))) ?? early[early.length - 1];
+  }
+  const L = t.losersRounds || [];
+  const sideRounds = () => (st.side === 'main' ? t.rounds : L);
+  const LNames = ['Quarterfinals', 'Semifinals', 'Final'];
+
+  const me = myTeamId();
+  const hit = (s) => {
+    if (!s) return false;
+    const q = st.q.trim().toLowerCase();
+    return q && s.name?.toLowerCase().includes(q);
+  };
+  const focus = () => (st.q.trim() ? S.teams.find((x) => x.name.toLowerCase().includes(st.q.trim().toLowerCase()))?.id : me);
+
+  const short = (x) => esc(x.name ?? S.byId.get(x.teamId)?.name ?? `Team ${x.teamId}`);
+  // Who can still fill an empty slot: the feeding match's winner, or both its teams.
+  const feeder = (key, side) => {
+    const [sd, r, i] = key.split(':').map((x, k) => (k ? Number(x) : x));
+    const prev = r > 0 ? (sd === 'main' ? t.rounds : L)[r - 1]?.[2 * i + (side === 'b' ? 1 : 0)] : null;
+    if (!prev) return null;
+    if (prev.winner) return short(prev.winner === 'a' ? prev.a : prev.b);
+    if (prev.a && prev.b) return `${short(prev.a)} <span class="muted">or</span> ${short(prev.b)}`;
+    return null;
+  };
+  const slotHtml = (m, side, state, p, key) => {
+    const s = m[side];
+    if (!s) return `<div class="bslot tbd"><span class="sd"></span><span class="nm muted">${m[`${side}Label`] ? esc(m[`${side}Label`]) : m.bye ? 'Bye' : feeder(key, side) ?? 'TBD'}</span><span class="sc"></span></div>`;
+    const won = m.winner === side, lost = m.winner && !won;
+    const right = state === 'done' || state === 'live' ? `<b>${scoreOf(m, side)}</b>` : state === 'ready' ? `<span class="muted small">${pct(side === 'a' ? p : 1 - p, 0)}</span>` : '';
+    return `<div class="bslot${won ? ' won' : ''}${lost ? ' lost' : ''}${s.teamId === me ? ' me' : ''}${hit(s) ? ' hit' : ''}">
+      <span class="sd">${s.seed ?? ''}</span><span class="nm">${esc(s.name ?? S.byId.get(s.teamId)?.name ?? `Team ${s.teamId}`)}</span><span class="sc">${right}</span></div>`;
+  };
+  const cardHtml = (m, key) => {
+    const state = matchState(m);
+    const p = m.a && m.b ? seriesP(m.a.teamId, m.b.teamId, m.a.elo, m.b.elo, bestOf) : null;
+    const upset = state === 'done' && m.a?.seed != null && m.b?.seed != null && (m.winner === 'a' ? m.a.seed > m.b.seed : m.b.seed > m.a.seed);
+    const label = { done: upset ? 'Upset' : 'Final', live: 'Live', ready: 'Up next', waiting: '', bye: 'Bye' }[state];
+    return `<button class="bmatch ${state}${upset ? ' upset' : ''}" data-key="${key}">
+      <div class="bhead"><span>${label}</span>${state === 'ready' || state === 'live' ? `<span class="muted">Bo${bestOf}</span>` : ''}</div>
+      ${slotHtml(m, 'a', state, p, key)}${slotHtml(m, 'b', state, p, key)}</button>`;
+  };
+  const involves = (m, id) => id != null && (m.a?.teamId === id || m.b?.teamId === id);
+
+  main.innerHTML = `
+    <h1>Qualifiers bracket</h1>
+    <p class="lede">The site's bracket, ${t.rounds[0].reduce((n, m) => n + (m.a ? 1 : 0) + (m.b ? 1 : 0), 0)} teams, best of ${bestOf} on unseen maps. The eight quarterfinalists qualify for the Grand Final, and the Round-of-16 losers play a second-chance bracket for two more places.
+    Click any match to see its games and replays. Percentages are each side's chance to win the series under the <a href="#/odds">odds model</a>.</p>
+    <div class="controls">
+      <div class="seg" id="bside" role="group" aria-label="Bracket"><button data-s="main">Main bracket</button><button data-s="second">Second chance</button></div>
+      <input type="search" id="bq" placeholder="Find a team…" value="${esc(st.q)}">
+      <span class="muted small" id="bfresh"></span>
+    </div>
+    <div id="bbody"></div>
+    <dialog id="bdlg" class="bdlg"><div id="bdlg-body"></div></dialog>`;
+
+  const fresh = () => {
+    const at = S.tour?.fetchedAt;
+    $('#bfresh').innerHTML = `${S.tour?.live ? '<span class="tag on">live</span> ' : ''}${at ? `bracket read ${ago(at)}` : ''}${t.status ? ` · ${esc(t.status)}` : ''}`;
+  };
+
+  const treeHtml = (rounds, names, offset, qualifyCol) => `<div class="btree" style="--cols:${rounds.length}">
+    ${rounds.map((round, ci) => `<div class="bcol"><div class="bcol-h">${names[ci]}${ci === qualifyCol ? ' <span class="tag on">qualify</span>' : ''}</div>
+      <div class="bcol-b">${round.map((m, i) => `<div class="bcell">${cardHtml(m, `${st.side}:${offset + ci}:${i}`)}</div>`).join('')}</div></div>`).join('')}
+  </div>`;
+
+  function body() {
+    $$('#bside button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.s === st.side)));
+    fresh();
+    const host = $('#bbody');
+    if (st.side === 'second') {
+      host.innerHTML = L.length ? `<div class="card">${treeHtml(L, LNames, 0, 2)}
+        <p class="muted small" style="margin-bottom:0">The eight Round-of-16 losers, reseeded by their original seed (1v8, 4v5, 2v7, 3v6). Both finalists qualify; the final itself is for pride.</p></div>`
+        : '<p class="muted">The second-chance bracket isn\'t published yet.</p>';
+      return;
+    }
+    const f = st.path ? focus() : null;
+    const list = t.rounds[st.round].map((m, i) => ({ m, i })).filter(({ m }) => {
+      if (f != null) return involves(m, f);
+      if (!st.byes && (m.bye || (!m.a || !m.b) && st.round === 0)) return false;
+      if (st.q.trim()) return hit(m.a) || hit(m.b);
+      return true;
+    });
+    const pathRows = f != null ? early.map((r) => ({ r, m: t.rounds[r].find((m) => involves(m, f)) })).filter((x) => x.m) : [];
+    host.innerHTML = `
+      <div class="card"><h2 style="margin-top:0">Round of 16 → Final</h2>${treeHtml(t.rounds.slice(treeFrom), ['Round of 16', 'Quarterfinals', 'Semifinals', 'Final'], treeFrom, 1)}</div>
+      <h2>Earlier rounds</h2>
+      <div class="controls">
+        <div class="seg" id="bround" role="group" aria-label="Round">${early.map((r) => {
+          const ms = t.rounds[r], done = ms.filter((m) => m.winner && !m.bye).length, real = ms.filter((m) => m.a && m.b).length;
+          return `<button data-r="${r}" title="${done} of ${real} played">${roundName(r).replace('Round of ', 'R')}</button>`;
+        }).join('')}</div>
+        <label class="chip"><input type="checkbox" id="bbyes" ${st.byes ? 'checked' : ''}>Show byes</label>
+        <label class="chip" title="Every round's match for the team you searched for, or your team"><input type="checkbox" id="bpath" ${st.path ? 'checked' : ''}>${st.q.trim() ? 'That team\'s path' : 'My team\'s path'}</label>
+      </div>
+      ${f != null && st.path ? `<div class="bgrid">${pathRows.map(({ r, m }) => `<div><div class="muted small">${roundName(r)}</div>${cardHtml(m, `main:${r}:${t.rounds[r].indexOf(m)}`)}</div>`).join('') || '<p class="muted">Not in the bracket.</p>'}</div>`
+        : `<p class="muted small">${roundName(st.round)} · ${list.length} match${list.length === 1 ? '' : 'es'} shown</p>
+      <div class="bgrid">${list.map(({ m, i }) => cardHtml(m, `main:${st.round}:${i}`)).join('') || '<p class="muted">No matches match.</p>'}</div>`}`;
+    $$('#bround button').forEach((b) => {
+      b.setAttribute('aria-pressed', String(Number(b.dataset.r) === st.round && !st.path));
+      b.onclick = () => { st.round = Number(b.dataset.r); st.path = false; save(); body(); };
+    });
+    $('#bbyes').onchange = (e) => { st.byes = e.target.checked; save(); body(); };
+    $('#bpath').onchange = (e) => { st.path = e.target.checked; save(); body(); };
+  }
+
+  const matchAt = (key) => {
+    const [side, r, i] = key.split(':');
+    return (side === 'main' ? t.rounds : L)[Number(r)]?.[Number(i)];
+  };
+  async function openMatch(key) {
+    const m = matchAt(key);
+    if (!m) return;
+    openKey = key;
+    const [side, r] = key.split(':');
+    const rn = side === 'main' ? roundName(Number(r)) : `Second chance · ${LNames[Number(r)]}`;
+    const dlg = $('#bdlg'), host = $('#bdlg-body');
+    if (!m.a || !m.b) {
+      host.innerHTML = `<div class="bdlg-h"><b>${esc(rn)}</b><button class="icon-btn" id="bclose" aria-label="Close">✕</button></div>
+        <p>${m.a ? teamLink(m.a.teamId, m.a.name) : esc(m.aLabel || 'TBD')} vs ${m.b ? teamLink(m.b.teamId, m.b.name) : esc(m.bLabel || (m.bye ? 'Bye' : 'TBD'))}</p>
+        <p class="muted">${m.bye ? 'A bye: this team goes straight through.' : 'Waiting on earlier results.'}</p>`;
+    } else {
+      const A = m.a, B = m.b, state = matchState(m);
+      const p = seriesP(A.teamId, B.teamId, A.elo, B.elo, bestOf), pg = gameP(A.teamId, B.teamId, A.elo, B.elo);
+      const games = m.games || [];
+      const nm = (s) => esc(s.name ?? S.byId.get(s.teamId)?.name ?? `Team ${s.teamId}`);
+      host.innerHTML = `<div class="bdlg-h"><b>${esc(rn)}</b> <span class="muted small">best of ${bestOf}</span><button class="icon-btn" id="bclose" aria-label="Close">✕</button></div>
+        <div class="bvs">
+          <div class="${m.winner === 'a' ? 'won' : ''}"><div class="muted small">Seed ${A.seed ?? '—'} · ${A.elo ?? S.byId.get(A.teamId)?.elo ?? '—'}</div><div class="big">${teamLink(A.teamId, A.name)}</div></div>
+          <div class="bscore">${state === 'done' || state === 'live' ? `${scoreOf(m, 'a')}–${scoreOf(m, 'b')}` : 'vs'}</div>
+          <div class="${m.winner === 'b' ? 'won' : ''}" style="text-align:right"><div class="muted small">Seed ${B.seed ?? '—'} · ${B.elo ?? S.byId.get(B.teamId)?.elo ?? '—'}</div><div class="big">${teamLink(B.teamId, B.name)}</div></div>
+        </div>
+        <div class="bbar" title="Model chance to win the series"><div style="width:${(p * 100).toFixed(1)}%"></div></div>
+        <div class="muted small" style="display:flex;justify-content:space-between"><span>${pct(p, 0)} to win the series · ${pct(pg, 0)} per game</span><span>${pct(1 - p, 0)}</span></div>
+        <h3>Games</h3>
+        ${games.length ? `<table class="bgames"><thead><tr><th>#</th><th>Map</th><th>Winner</th><th class="num">Running</th><th></th></tr></thead><tbody>
+          ${(() => { let wa = 0, wb = 0; return games.map((g, k) => {
+            if (g.winner === 'a') wa++; else if (g.winner === 'b') wb++;
+            return `<tr><td class="num">${k + 1}</td><td>${esc(g.map || '—')}</td>
+              <td>${g.winner === 'a' ? nm(A) : g.winner === 'b' ? nm(B) : g.winner ? esc(g.winner) : '<span class="muted">in progress</span>'}</td>
+              <td class="num">${wa}–${wb}</td><td class="small">${g.id ? replayLink(g.id) : ''}</td></tr>`; }).join(''); })()}
+          </tbody></table>
+          <p class="small">${games[0]?.id ? replayLink(games[0].id, 'Open the whole match on the game site →') : ''}</p>`
+          : `<p class="muted">Not played yet.${state === 'ready' ? ` ${nm(p >= 0.5 ? A : B)} are favoured.` : ''}</p>`}
+        <h3>Before the Qualifiers</h3><div id="bh2h" class="small muted">Loading head-to-head…</div>
+        <p class="small"><a href="#/matchup?a=${A.teamId}&b=${B.teamId}">Full matchup breakdown →</a></p>`;
+      teamDetail(A.teamId).then((d) => {
+        const el = $('#bh2h');
+        if (!el || openKey !== key) return;
+        const h = d?.h2h?.find((x) => x.opp === B.teamId);
+        el.innerHTML = h ? `On the ladder: ${nm(A)} ${h.series[0]}–${h.series[1]}–${h.series[2]} in battles (W–D–L), ${h.games[0]}–${h.games[2]} in games, last met ${ago(h.last)}.`
+          : 'They haven\'t met in the battles this site has recorded.';
+        el.classList.remove('muted');
+      });
+    }
+    $('#bclose').onclick = () => dlg.close();
+    if (!dlg.open) dlg.showModal();
+  }
+  $('#bdlg').addEventListener('click', (e) => { if (e.target.id === 'bdlg') e.target.close(); });
+  $('#bdlg').addEventListener('close', () => { openKey = null; });
+
+  $('#bbody').addEventListener('click', (e) => {
+    if (e.target.closest('a')) return;
+    const b = e.target.closest('.bmatch');
+    if (b) openMatch(b.dataset.key);
+  });
+  $$('#bside button').forEach((b) => { b.onclick = () => { st.side = b.dataset.s; save(); body(); }; });
+  $('#bq').oninput = (e) => { st.q = e.target.value; body(); };
+  body();
+
+  // Follow the event: re-read the brackets every minute and redraw if they changed.
+  S.bracketTimer = setInterval(async () => {
+    if (location.hash.split('?')[0] !== '#/bracket') return clearInterval(S.bracketTimer);
+    if (await refreshTournaments()) {
+      const nt = S.tour.tournaments.find((x) => x.id === 'qualifier');
+      if (nt) { t.rounds = nt.rounds; t.losersRounds = nt.losersRounds; t.status = nt.status; }
+      body();
+      if (openKey) openMatch(openKey);
+    } else fresh();
+  }, 60000);
 }
 
 // ---- maps -------------------------------------------------------------------------
@@ -1337,18 +1573,20 @@ function route() {
   const path = p || '/';
   const nav = path.startsWith('/team/') ? 'leaderboard' : path.slice(1) || 'leaderboard';
   $$('.nav a').forEach((a) => a.classList.toggle('active', a.dataset.nav === nav));
-  document.body.classList.toggle('wide', path === '/maps');
+  document.body.classList.toggle('wide', path === '/maps' || path === '/bracket');
+  clearInterval(S.bracketTimer);
   window.scrollTo(0, 0);
   let m;
   if ((m = path.match(/^\/team\/(\d+)/))) viewTeam(Number(m[1]));
   else if (path === '/maps') viewMaps();
   else if (path === '/matchup') viewMatchup(params);
   else if (path === '/odds') viewOdds(params);
+  else if (path === '/bracket') viewBracket(params);
   else if (path === '/battles') viewBattles();
   else if (path === '/stats') viewStats();
   else if (path === '/about') viewAbout();
   else viewLeaderboard();
-  const name = { leaderboard: 'Leaderboard', maps: 'Map Elo', odds: 'Odds', matchup: 'Matchup', battles: 'Battles', stats: 'Stats', about: 'About' }[nav];
+  const name = { leaderboard: 'Leaderboard', maps: 'Map Elo', odds: 'Odds', bracket: 'Bracket', matchup: 'Matchup', battles: 'Battles', stats: 'Stats', about: 'About' }[nav];
   const team = m && S.byId.get(Number(m[1]));
   document.title = `${team ? team.name : name || 'Leaderboard'} · Battlecode Stats`;
 }
@@ -1367,7 +1605,7 @@ async function boot() {
     S.teams = teams.sort((a, b) => a.rank - b.rank);
     S.byId = new Map(teams.map((t) => [t.id, t]));
     S.meta = meta;
-    S.tour = tour;
+    S.tour = await getTournaments(tour);
   } catch (err) {
     main.innerHTML = `<div class="card"><h1>No data yet</h1><p>The data files couldn't be loaded (${esc(err.message)}). If this is a fresh deploy, the first scrape may still be running.</p></div>`;
     return;

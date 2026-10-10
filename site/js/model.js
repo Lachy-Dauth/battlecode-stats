@@ -204,14 +204,21 @@ export function simulate(cfg) {
       // Loser bracket: R16 losers reseeded by original seed, 1v8 4v5 2v7 3v6; the two semi winners qualify.
       const L = r16Losers.sort((a, b) => qual.seedOf[a] - qual.seedOf[b]);
       const lr = [];
+      const lf = qual.losersForced || [];
+      const pick = (r, m, a, b) => {
+        const f = lf[r]?.[m];
+        if (a == null || b == null) return a ?? b;
+        if (f != null && (f === a || f === b)) return f;
+        return rand() < prob(a, b, qual.series) ? a : b;
+      };
       for (const [x, y] of [[0, 7], [3, 4], [1, 6], [2, 5]]) {
         const a = L[x], b = L[y];
-        lr.push(a == null || b == null ? a ?? b : rand() < prob(a, b, qual.series) ? a : b);
+        lr.push(pick(0, lr.length, a, b));
       }
       const lq = [];
       for (const [x, y] of [[0, 1], [2, 3]]) {
         const a = lr[x], b = lr[y];
-        lq.push(a == null || b == null ? a ?? b : rand() < prob(a, b, qual.series) ? a : b);
+        lq.push(pick(1, lq.length, a, b));
       }
       for (const id of qfTeams) { bump(qualOut, id, QN, 0); bump(qualOut, id, QN, 2); }
       for (const id of lq) if (id != null) { bump(qualOut, id, QN, 1); bump(qualOut, id, QN, 2); }
@@ -253,7 +260,7 @@ export function simulate(cfg) {
     let rounds = 0;
     while (2 ** rounds < b.slots.length) rounds++;
     return {
-      slots: b.slots, rounds, forced: b.forced, seedOf: b.seedOf || {},
+      slots: b.slots, rounds, forced: b.forced, seedOf: b.seedOf || {}, losersForced: b.losersForced,
       series: seriesFn(b.bestOf ?? 7), entrants: b.slots.filter((x) => x != null),
     };
   }

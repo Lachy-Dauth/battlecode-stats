@@ -606,14 +606,7 @@ async function writeOutputs({ teams, tournaments, battles, details, rankLog = {}
     log(`map Elo: ${maps.payload.maps.length} maps; ${maps.meta.linked}/${maps.meta.rankedGames} ranked games linked to their battle, ${maps.meta.unrated} unrated`);
   }
 
-  // Tournaments + Grand Final (the site lists it but has no bracket page for it yet).
-  await writeJSON(path.join(OUT, 'tournaments.json'), {
-    tournaments,
-    grandFinal: {
-      id: 'grand-final', name: 'Grand Final', teams: 10, bestOf: 5, date: '2026-10-17T00:00:00.000Z',
-      venue: 'UNSW Sydney', prize: '$8,000 first, $18,500 across the top six', entry: 'Qualifier winners',
-    },
-  });
+  await writeTournaments(tournaments);
 
   // Recent battles feed.
   const recent = [...battles.values()].sort((x, y) => y[B.at] - x[B.at]).slice(0, 800).map((r) => ({
@@ -650,9 +643,28 @@ async function writeOutputs({ teams, tournaments, battles, details, rankLog = {}
   log(`wrote ${outTeams.length} teams, ${recent.length} recent battles; fitted Elo divisor ${calibration.fittedDivisor} over ${calibration.games} games`);
 }
 
+// Tournaments + Grand Final (the site lists it but has no bracket page for it yet).
+async function writeTournaments(tournaments) {
+  await writeJSON(path.join(OUT, 'tournaments.json'), {
+    fetchedAt: Math.floor(Date.now() / 1000),
+    tournaments,
+    grandFinal: {
+      id: 'grand-final', name: 'Grand Final', teams: 10, bestOf: 5, date: '2026-10-17T00:00:00.000Z',
+      venue: 'UNSW Sydney', prize: '$8,000 first, $18,500 across the top six', entry: 'Qualifier winners',
+    },
+  });
+}
+
 // ---- main ----------------------------------------------------------------------------
 async function main() {
   await fs.mkdir(STATE, { recursive: true });
+  if (args['tournaments-only']) {
+    // Brackets only, for following a live event (scripts/live.sh); a few requests.
+    await fs.mkdir(OUT, { recursive: true });
+    await writeTournaments(await fetchTournaments());
+    log(`tournaments: ${stats.requests} requests`);
+    return;
+  }
   const cursor = await readJSON(path.join(STATE, 'cursor.json'), {});
   const battles = await loadBattles();
   const details = await readJSON(path.join(STATE, 'details.json'), {});
